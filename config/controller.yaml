@@ -1,4 +1,4 @@
-/controller:
+/oct_controllers:
   ros__parameters:
     foo: 1.0
 
