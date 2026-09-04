@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 
-# Copyright 2022 Open Source Robotics Foundation, Inc. and Monterey Bay Aquarium Research Institute
+# Copyright 2022 Open Source Robotics Foundation, Inc. and Monterey Bay 
+# Aquarium Research Institute
+# Copyright 2026 Alex Eagan
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,41 +15,160 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import threading
+import random
+
+import numpy as np
+
+import rclpy
+from rcl_interfaces.msg import SetParametersResult
+from rclpy.duration import Duration #For timing
 
 from buoy_api import Interface
-import rclpy
-
 
 class ControlPolicy(object):
-
+    """Common for all control policies"""
     def __init__(self):
-        # Define any parameter variables here
-        self.foo = 1.0
+        self.state = {
+            "range": 0.0,
+        }
+        self.lock = threading.Lock()
 
-        self.update_params()
+    ## Updates for Spring Callback ##
+    def update_range(self, state):
+        with self.lock:
+            self.state["range"] = state["range"]
+
+
+
+    def reset(self):
+        """Reset state when entering/leaving control mode"""
+        pass
+
+################## Control Policies ###################################
+class StepwiseRandomBoundedPolicy(ControlPolicy):
+    """SystemID:
+       Control that provides stepwise random control inputs 
+        on a 2s interval
+       Is bounded by piston stroke 
+    """
+    def __init__(self):
+        super().__init__()
+        self._u_on = False #Control State
+        self.u = 0.0 #Control Input
+        self._rel_time = 0.0 #Relative time
+
+        self._target = {
+            "Control Knob": 'Winding Current',
+            "Value": 0.0,
+        }
 
     def update_params(self):
-        """Update dependent variables after reading in params."""
-        self.bar = 10.0 * self.foo
+        pass
 
-        pass  # remove if there's anything to set above
+    def target(self, state, now):
+        self._target["Value"] = self.u
+        return self._target
 
-    # Modify function inputs as desired
-    def target(self, *args, **kwargs):  # noqa: D202
-        """Calculate target value from feedback inputs."""
+    def reset(self):
+        with self.lock:
+           self._u_on = False
+           self.u = 0.0
+           self._rel_time = 0.0
 
-        # secret sauce
 
-        return 0.0  # obviously, modify to return proper target value
+        
+class StepwiseIntegratedBoundedPolicy(ControlPolicy):
+    """SystemID:
+       Control that provides stepwise random control inputs 
+        on an integrated interval
+       Is bounded by piston stroke 
+    """
+    def __init__(self):
+        super().__init__()
+
+        self._target = {
+            "Control Knob": '',
+            "Value": 0.0,
+        }
+
+    def update_params(self):
+        pass
+
+    def target(self, state, now):
+        self._target["Value"] = 0.0 
+        return self._target
+
+    def reset(set):
+        pass
+
+class FreeResponsePolicy(ControlPolicy):
+    """SystemID:
+       Truly free response control policy 
+    """
+    def __init__(self):
+        super().__init__()
+        self._target = {
+            "Control Knob": 'None',
+            "Value": 0.0,
+        }
+
+    def target(self, state, now):
+        return self._target
+
+    def reset(self):
+        pass
 
 
 class Controller(Interface):
+    """Shared buoy interface with swappable control policies"""
 
     def __init__(self):
         super().__init__('controller')
 
-        self.policy = ControlPolicy()
+        self._policy_lock = threading.Lock()
+        self.policies = {
+            "stepwise_random_bounded": StepwiseRandomBoundedPolicy(),
+            "free_response": FreeResponsePolicy(),
+            "stepwise_integrated_bounded": StepwiseIntegratedBoundedPolicy(),
+        }
+        self.active_policy_name = "free_response"
+
         self.set_params()
+        self.add_on_set_parameters_callback(self.parameter_callback)
+
+    @property
+    def active_policy(self):
+            with self._policy_lock:
+                return self.policies[self.active_policy_name]
+
+    def set_params(self):
+        self.declare_parameter(
+            "active_policy",
+            "free_response" #Default parameter
+            )
+
+    def parameter_callback(self, params):
+        for param in params:
+            if param.name != "active_policy":
+                continue
+
+            if param.value not in self.policies:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"Unknown policy: {param.value}",
+                )
+
+            with self._policy_lock:
+                old_name = self.active_policy_name
+                if old_name != param.value:
+                    self.policies[old_name].reset()
+                    self.policies[param.value].reset()
+                    self.active_policy_name = param.value
+                    self.get_logger().info(
+                        f"Switched policy from {old_name} -> {param.value}"
+                    )
+        return SetParametersResult(successful=True)
 
         # set packet rates from controllers here
         # controller defaults to publishing @ 10Hz
@@ -93,9 +214,14 @@ class Controller(Interface):
 
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
-        # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        ## Updates for state variables ##
+        self.policy.update_range(data.range_finder)
+
+        ## Update the policy as needed
+        self.policy.update_params()
+
+        ## Send out command
+        self.send_command()
 
     def power_callback(self, data):
         """Provide feedback of '/power_data' topic from Power Controller."""
@@ -112,30 +238,52 @@ class Controller(Interface):
     def powerbuoy_callback(self, data):
         """Provide feedback of '/powerbuoy_data' topic -- Aggregated data from all topics."""
         # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
         pass  # remove if there's anything to do above
 
-    def latent_callback(self, data):
-        """Provide feedback of '/latent_data' topic -- SIM ONLY values (e.g. losses, wave data)."""
-        # Potentially evaluate controller performance against sim only (latent data NOT AVAILABLE
-        # in physical buoy)
-        pass  # remove if there's anything to do above
+    def send_command(self):
+        with self._state_lock: #Take state "screenshot"
+            state = dict(self.state)
+    
+        with self._policy_lock:
+            policy = self.policies[self.active_policy_name]
+        now = self.get_clock().now()
 
-    def set_params(self):
-        """Use ROS2 declare_parameter and get_parameter to set policy params."""
-        self.declare_parameter('foo', self.policy.foo)
-        self.policy.foo = \
-            self.get_parameter('foo').get_parameter_value().double_value
+        target  = policy.target(state, now) #Get target with screenshot
 
-        # recompute any dependent variables
-        self.policy.update_params()
+        match target["Control Knob"]:
+            case 'Pump':
+                self.send_pump_command(target["Value"], blocking=False)
+            case 'Valve':
+                self.send_valve_command(target["Value"], blocking=False)
+            case 'Winding Current':
+                self.send_pc_wind_curr_command(target["Value"], blocking=False)
+            case 'Bias Current':
+                self.send_pc_bias_curr_command(target["Value"], blocking=False)
+            case 'Scale':
+                self.send_scale_command(target["Value"], blocking=False)
+            case 'Retract':
+                self.send_retract_command(target["Value"], blocking=False)
+            case 'None':
+                    self.send_pump_command(0.0, blocking=False)
+                    self.send_valve_command(0.0, blocking=False)
+                    self.send_pc_wind_curr_command(0.0, blocking=False)
+                    self.send_pc_bias_curr_command(0.0, blocking=False)
+            case _:
+                self.get_logger().info(
+                    f"Send Command function called without matching control"
+                    )
+                pass
+
 
 
 def main():
     rclpy.init()
     controller = Controller()
-    controller.spin()
-    rclpy.shutdown()
+    try:
+        controller.spin()
+    finally:
+        controller.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
