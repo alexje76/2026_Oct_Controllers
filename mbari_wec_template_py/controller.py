@@ -33,13 +33,33 @@ class ControlPolicy(object):
             "range": 0.0,
         }
         self.lock = threading.Lock()
+        #Default States for bounding
+        self._piston_bounded = False
 
     ## Updates for Spring Callback ##
     def update_range(self, state):
         with self.lock:
             self.state["range"] = state["range"]
 
+    ## Bounding for target ##
+    def piston_bounding(self, target):
+        with self.lock:
+            bounded_target = dict(target)
+            spring_bound_upper = 65 #TODO
+            spring_bound_lower = 15 #TODO
+            if (
+                self.state["range"] < spring_bound_lower or 
+                self.state["range"] > spring_bound_upper
+            ):
+                bounded_target["Value"] = 0.0
+                #TODO add logging
+            else:
+                pass
+            return bounded_target
 
+    def update_params(self, now):
+        """Placeholder update_params"""
+        pass
 
     def reset(self):
         """Reset state when entering/leaving control mode"""
@@ -54,17 +74,41 @@ class StepwiseRandomBoundedPolicy(ControlPolicy):
     """
     def __init__(self):
         super().__init__()
-        self._u_on = False #Control State
+        self._piston_bounded = True
+
+        self._u_on = False # Control State
+        self._u_range = 4.0 #Winding current amps
         self.u = 0.0 #Control Input
-        self._rel_time = 0.0 #Relative time
+        self._swap_time = None
+        self._swap_duration = Duration(seconds = 2.0)
 
         self._target = {
             "Control Knob": 'Winding Current',
             "Value": 0.0,
         }
 
-    def update_params(self):
-        pass
+        self.update_params(now = None)
+
+    def update_params(self, now):
+        #Setup Call
+        if now is None:
+            return
+        
+        with self.lock:
+            #First calls
+            if self._swap_time is None:
+                self._swap_time = now
+            #End of First call 
+
+            elapsed = now - self._swap_time
+
+            if elapsed >= self._swap_duration:
+                self._swap_time = now
+                if self._u_on:
+                    self.u = random.uniform(-self._u_range, self._u_range)
+                else:
+                    self.u = 0
+                self._u_on = not self._u_on
 
     def target(self, state, now):
         self._target["Value"] = self.u
@@ -74,7 +118,7 @@ class StepwiseRandomBoundedPolicy(ControlPolicy):
         with self.lock:
            self._u_on = False
            self.u = 0.0
-           self._rel_time = 0.0
+           self._swap_time = None
 
 
         
@@ -91,6 +135,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
             "Control Knob": '',
             "Value": 0.0,
         }
+        self.update_params()
 
     def update_params(self):
         pass
@@ -112,6 +157,7 @@ class FreeResponsePolicy(ControlPolicy):
             "Control Knob": 'None',
             "Value": 0.0,
         }
+        self.update_params()
 
     def target(self, state, now):
         return self._target
@@ -198,27 +244,23 @@ class Controller(Interface):
     # self.send_pc_scale_command(scale_factor, blocking=False)
     # self.send_pc_retract_command(retract_factor, blocking=False)
 
-    # Delete any unused callback
-
     def ahrs_callback(self, data):
         """Provide feedback of '/ahrs_data' topic from XBowAHRS."""
         # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        pass
 
     def battery_callback(self, data):
         """Provide feedback of '/battery_data' topic from Battery Controller."""
         # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        pass
 
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
         ## Updates for state variables ##
-        self.policy.update_range(data.range_finder)
+        self.active_policy.update_range(data.range_finder)
 
         ## Update the policy as needed
-        self.policy.update_params()
+        self.active_policy.update_params(self.get_clock().now())
 
         ## Send out command
         self.send_command()
@@ -226,19 +268,17 @@ class Controller(Interface):
     def power_callback(self, data):
         """Provide feedback of '/power_data' topic from Power Controller."""
         # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        pass
 
     def trefoil_callback(self, data):
         """Provide feedback of '/trefoil_data' topic from Trefoil Controller."""
         # Update class variables, get control policy target, send commands, etc.
-        # target_value = self.policy.target(data)
-        pass  # remove if there's anything to do above
+        pass
 
     def powerbuoy_callback(self, data):
         """Provide feedback of '/powerbuoy_data' topic -- Aggregated data from all topics."""
         # Update class variables, get control policy target, send commands, etc.
-        pass  # remove if there's anything to do above
+        pass 
 
     def send_command(self):
         with self._state_lock: #Take state "screenshot"
@@ -249,6 +289,9 @@ class Controller(Interface):
         now = self.get_clock().now()
 
         target  = policy.target(state, now) #Get target with screenshot
+
+        if policy._piston_bounded:
+            target = policy.piston_bounding(target)
 
         match target["Control Knob"]:
             case 'Pump':
@@ -274,8 +317,6 @@ class Controller(Interface):
                     )
                 pass
 
-
-
 def main():
     rclpy.init()
     controller = Controller()
@@ -284,7 +325,6 @@ def main():
     finally:
         controller.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
