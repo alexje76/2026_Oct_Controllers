@@ -37,9 +37,9 @@ class ControlPolicy(object):
         self._piston_bounded = False
 
     ## Updates for Spring Callback ##
-    def update_range(self, state):
+    def update_range(self, value):
         with self.lock:
-            self.state["range"] = state["range"]
+            self.state["range"] = float(value)
 
     ## Bounding for target ##
     def piston_bounding(self, target):
@@ -130,22 +130,61 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
     """
     def __init__(self):
         super().__init__()
+        self._piston_bounded = True
+
+        self._u_on = False # Control State
+        self._u_range = 35
+        self.u = 0.0
+        self._currentseconds = 0.0
+        self._currentseconds_max = 8.0
+        self._swap_time = None
+        self._swap_duration = Duration(seconds = 2.0)
 
         self._target = {
-            "Control Knob": '',
+            "Control Knob": 'Winding Current',
             "Value": 0.0,
         }
-        self.update_params()
+        self.update_params(None)
 
-    def update_params(self):
-        pass
+    def update_params(self, now):
+        #Setup Call
+        if now is None:
+            return
+
+        with self.lock:
+            #First calls
+            if self._swap_time is None:
+                self._swap_time = now
+            #End of First call 
+
+            if self._u_on:
+                elapsed = (now - self._swap_time).total_seconds()
+                self._currentseconds = elapsed*self.u
+                if abs(self._currentseconds) >= self._currentseconds_max:
+                    self.u = 0.0
+                    self._currentseconds = 0.0
+                    self._u_on = False
+                else:
+                    pass
+            else: #Branch for if control is currently off
+                elapsed = now - self._swap_time
+                if elapsed >= self._swap_duration:
+                    self.u = random.uniform(-self._u_range, self._u_range)
+                    self._u_on = True 
+                    self._swap_time = now
+                else:
+                    pass
 
     def target(self, state, now):
-        self._target["Value"] = 0.0 
+        self._target["Value"] = self.u
         return self._target
 
-    def reset(set):
-        pass
+    def reset(self):
+        with self.lock:
+            self._u_on = False
+            self.u = 0.0
+            self._currentseconds = 0.0
+            self._swap_time = None
 
 class FreeResponsePolicy(ControlPolicy):
     """SystemID:
@@ -153,6 +192,8 @@ class FreeResponsePolicy(ControlPolicy):
     """
     def __init__(self):
         super().__init__()
+        self._piston_bounded = True
+
         self._target = {
             "Control Knob": 'None',
             "Value": 0.0,
@@ -173,6 +214,7 @@ class Controller(Interface):
         super().__init__('controller')
 
         self._policy_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self.policies = {
             "stepwise_random_bounded": StepwiseRandomBoundedPolicy(),
             "free_response": FreeResponsePolicy(),
@@ -303,9 +345,9 @@ class Controller(Interface):
             case 'Bias Current':
                 self.send_pc_bias_curr_command(target["Value"], blocking=False)
             case 'Scale':
-                self.send_scale_command(target["Value"], blocking=False)
+                self.send_pc_scale_command(target["Value"], blocking=False)
             case 'Retract':
-                self.send_retract_command(target["Value"], blocking=False)
+                self.send_pc_retract_command(target["Value"], blocking=False)
             case 'None':
                     self.send_pump_command(0.0, blocking=False)
                     self.send_valve_command(0.0, blocking=False)
