@@ -52,6 +52,8 @@ class ControlPolicy(object):
                 self.state["range"] > spring_bound_upper
             ):
                 bounded_target["Value"] = 0.0
+                self.get_logger().info(f'Target piston bounded, Overwritten '
+                                       'with 0.0 Wind Curr')
                 #TODO add logging
             else:
                 pass
@@ -335,6 +337,9 @@ class Controller(Interface):
         if policy._piston_bounded:
             target = policy.piston_bounding(target)
 
+        self.get_logger().info(
+            f"{self.active_policy_name} sending {target["Control Knob"]} value {target["Value"]}"
+        )
         match target["Control Knob"]:
             case 'Pump':
                 self.send_pump_command(target["Value"], blocking=False)
