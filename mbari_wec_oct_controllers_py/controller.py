@@ -52,6 +52,7 @@ class ControlPolicy(object):
                 self.state["range"] < spring_bound_lower or 
                 self.state["range"] > spring_bound_upper
             ):
+                self._logger.info(f"srping range inside piston bounding is:{self.state["range"]}")
                 bounded_target["Value"] = 0.0
                 self._logger.info(f'Target piston bounded, Overwritten '
                                        'with 0.0 Wind Curr')
@@ -161,7 +162,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
             #End of First call 
 
             if self._u_on:
-                elapsed = (now - self._swap_time).total_seconds()
+                elapsed = (now - self._swap_time).nanoseconds / 1e9
                 self._currentseconds = elapsed*self.u
                 if abs(self._currentseconds) >= self._currentseconds_max:
                     self.u = 0.0
