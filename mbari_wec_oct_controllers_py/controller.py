@@ -202,6 +202,9 @@ class FreeResponsePolicy(ControlPolicy):
         }
         self.update_params()
 
+    def update_params(self, now):
+        pass
+
     def target(self, state, now):
         return self._target
 
