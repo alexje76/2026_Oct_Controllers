@@ -76,7 +76,7 @@ class StepwiseRandomBoundedPolicy(ControlPolicy):
        Is bounded by piston stroke 
     """
     def __init__(self, logger):
-        super().__init__()
+        super().__init__(logger)
         self._piston_bounded = True
 
         self._u_on = False # Control State
@@ -132,7 +132,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
        Is bounded by piston stroke 
     """
     def __init__(self, logger):
-        super().__init__()
+        super().__init__(logger)
         self._piston_bounded = True
 
         self._u_on = False # Control State
@@ -194,7 +194,7 @@ class FreeResponsePolicy(ControlPolicy):
        Truly free response control policy 
     """
     def __init__(self, logger):
-        super().__init__()
+        super().__init__(logger)
         self._piston_bounded = True
 
         self._target = {
