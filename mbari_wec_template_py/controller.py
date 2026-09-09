@@ -45,8 +45,8 @@ class ControlPolicy(object):
     def piston_bounding(self, target):
         with self.lock:
             bounded_target = dict(target)
-            spring_bound_upper = 65 #TODO
-            spring_bound_lower = 15 #TODO
+            spring_bound_upper = 65 #NEED TO CHECK THAT THERE IS NOT INCHES CONVERSION NEEDED
+            spring_bound_lower = 15
             if (
                 self.state["range"] < spring_bound_lower or 
                 self.state["range"] > spring_bound_upper
