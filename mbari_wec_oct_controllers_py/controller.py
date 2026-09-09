@@ -200,7 +200,7 @@ class FreeResponsePolicy(ControlPolicy):
             "Control Knob": 'None',
             "Value": 0.0,
         }
-        self.update_params()
+        self.update_params(None)
 
     def update_params(self, now):
         pass
