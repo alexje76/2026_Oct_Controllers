@@ -28,11 +28,12 @@ from buoy_api import Interface
 
 class ControlPolicy(object):
     """Common for all control policies"""
-    def __init__(self):
+    def __init__(self, logger):
         self.state = {
             "range": 0.0,
         }
         self.lock = threading.Lock()
+        self._logger = logger
         #Default States for bounding
         self._piston_bounded = False
 
@@ -52,7 +53,7 @@ class ControlPolicy(object):
                 self.state["range"] > spring_bound_upper
             ):
                 bounded_target["Value"] = 0.0
-                self.get_logger().info(f'Target piston bounded, Overwritten '
+                self._logger().info(f'Target piston bounded, Overwritten '
                                        'with 0.0 Wind Curr')
                 #TODO add logging
             else:
@@ -220,10 +221,11 @@ class Controller(Interface):
 
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self.state = {}
         self.policies = {
-            "stepwise_random_bounded": StepwiseRandomBoundedPolicy(),
-            "free_response": FreeResponsePolicy(),
-            "stepwise_integrated_bounded": StepwiseIntegratedBoundedPolicy(),
+            "stepwise_random_bounded": StepwiseRandomBoundedPolicy(self.get_logger()),
+            "free_response": FreeResponsePolicy(self.get_logger()),
+            "stepwise_integrated_bounded": StepwiseIntegratedBoundedPolicy(self.get_logger()),
         }
         self.active_policy_name = "free_response"
 
@@ -341,7 +343,7 @@ class Controller(Interface):
             target = policy.piston_bounding(target)
 
         self.get_logger().info(
-            f"{self.active_policy_name} sending {target["Control Knob"]} value {target["Value"]}"
+            f"{self.active_policy_name} sending {target['Control Knob']} value {target['Value']}"
         )
         match target["Control Knob"]:
             case 'Pump':
