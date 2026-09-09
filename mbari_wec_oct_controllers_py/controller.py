@@ -75,7 +75,7 @@ class StepwiseRandomBoundedPolicy(ControlPolicy):
         on a 2s interval
        Is bounded by piston stroke 
     """
-    def __init__(self):
+    def __init__(self, logger):
         super().__init__()
         self._piston_bounded = True
 
@@ -131,7 +131,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
         on an integrated interval
        Is bounded by piston stroke 
     """
-    def __init__(self):
+    def __init__(self, logger):
         super().__init__()
         self._piston_bounded = True
 
@@ -193,7 +193,7 @@ class FreeResponsePolicy(ControlPolicy):
     """SystemID:
        Truly free response control policy 
     """
-    def __init__(self):
+    def __init__(self, logger):
         super().__init__()
         self._piston_bounded = True
 
