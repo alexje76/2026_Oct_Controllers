@@ -40,7 +40,7 @@ class ControlPolicy(object):
     ## Updates for Spring Callback ##
     def update_range(self, value):
         with self.lock:
-            self.state["range"] = float(value)
+            self.state["range"] = float(value) * 39.3701 #Converts from m to in
 
     ## Bounding for target ##
     def piston_bounding(self, target):
