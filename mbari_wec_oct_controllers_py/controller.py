@@ -53,7 +53,7 @@ class ControlPolicy(object):
                 self.state["range"] > spring_bound_upper
             ):
                 bounded_target["Value"] = 0.0
-                self._logger().info(f'Target piston bounded, Overwritten '
+                self._logger.info(f'Target piston bounded, Overwritten '
                                        'with 0.0 Wind Curr')
                 #TODO add logging
             else:
