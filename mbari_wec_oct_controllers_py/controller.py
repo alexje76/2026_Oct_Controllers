@@ -72,7 +72,7 @@ class DailyCsvLogger:
         self._day = now.date()
         self._last_flush = time.monotonic()
 
-    def _seconds_string_from_ns(ns):
+    def _seconds_string_from_ns(self, ns):
         seconds, nanoseconds = divmod(int(ns), 1_000_000_000)
         return f"{seconds}.{nanoseconds:09d}"
 
