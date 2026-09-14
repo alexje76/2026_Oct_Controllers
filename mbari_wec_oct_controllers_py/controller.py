@@ -36,7 +36,14 @@ from buoy_api import Interface
 OUTPUT_DIR = os.path.expanduser("~/BuoyLogging")
 
 class DailyCsvLogger:
-    HEADER = ("timestamp", "event", "controller", "previous_controller")
+    HEADER = (
+        "timestamp_utc",
+        "wall_epoch_seconds",
+        "ros_epoch_seconds",
+        "event",
+        "controller",
+        "previous_controller",
+    )
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -65,15 +72,39 @@ class DailyCsvLogger:
         self._day = now.date()
         self._last_flush = time.monotonic()
 
-    def log(self, event, controller, previous_controller="", flush=False):
-        now = datetime.now(timezone.utc)
+    def _seconds_string_from_ns(ns):
+        seconds, nanoseconds = divmod(int(ns), 1_000_000_000)
+        return f"{seconds}.{nanoseconds:09d}"
+
+    def log(
+        self,
+        event,
+        controller,
+        previous_controller="",
+        ros_time_ns=None,
+        flush=False,
+    ):
+        wall_time_ns = time.time_ns()
+        wall_seconds = _seconds_string_from_ns(wall_time_ns)
+        now = datetime.fromtimestamp(
+            wall_time_ns / 1_000_000_000,
+            timezone.utc,
+        )
+
+        ros_seconds = (
+            ""
+            if ros_time_ns is None
+            else _seconds_string_from_ns(ros_time_ns)
+        )
 
         with self._lock:
             if now.date() != self._day:
                 self._open_file(now)
 
             self._writer.writerow((
-                now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                wall_seconds,
+                ros_seconds,
                 event,
                 controller,
                 previous_controller,
@@ -298,7 +329,7 @@ class Controller(Interface):
 
         self.set_params()
 
-        self._csv_logger.log(
+        self._log_csv(
             event="controller_started",
             controller=self.active_policy_name,
             flush=True,
@@ -308,6 +339,25 @@ class Controller(Interface):
         self._minute_log_timer = self.create_timer(
             60.0,
             self._log_controller_minute,
+        )
+
+    def _log_csv(
+        self,
+        event,
+        controller,
+        previous_controller="",
+        flush=False,
+    ):
+        # Node.get_clock() is ROS_TIME. It follows /clock when
+        # use_sim_time is enabled.
+        ros_time_ns = self.get_clock().now().nanoseconds
+
+        self._csv_logger.log(
+            event=event,
+            controller=controller,
+            previous_controller=previous_controller,
+            ros_time_ns=ros_time_ns,
+            flush=flush,
         )
 
     @property
@@ -354,12 +404,12 @@ class Controller(Interface):
                     f"Switched policy from {old_name} -> {new_name}"
                 )
 
-                self._csv_logger.log(
-                    event="controller_swapped",
-                    controller=new_name,
-                    previous_controller=old_name,
-                    flush=True,
-                )
+        self._log_csv(
+            event="controller_swapped",
+            controller=new_name,
+            previous_controller=old_name,
+            flush=True,
+        )
 
         return SetParametersResult(successful=True)
 
@@ -367,7 +417,7 @@ class Controller(Interface):
         with self._policy_lock:
             policy_name = self.active_policy_name
 
-        self._csv_logger.log(
+        self._log_csv(
             event="controller_minute",
             controller=policy_name,
         )
