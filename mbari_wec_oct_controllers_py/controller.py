@@ -33,7 +33,7 @@ from rclpy.duration import Duration #For timing
 from buoy_api import Interface
 
 ## Logging
-OUTPUT_DIR = os.path.exanduser("~/BuoyLogging")
+OUTPUT_DIR = os.path.expanduser("~/BuoyLogging")
 
 class DailyCsvLogger:
     HEADER = ("timestamp", "event", "controller", "previous_controller")
