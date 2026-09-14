@@ -85,7 +85,7 @@ class DailyCsvLogger:
         flush=False,
     ):
         wall_time_ns = time.time_ns()
-        wall_seconds = _seconds_string_from_ns(wall_time_ns)
+        wall_seconds = self._seconds_string_from_ns(wall_time_ns)
         now = datetime.fromtimestamp(
             wall_time_ns / 1_000_000_000,
             timezone.utc,
@@ -94,7 +94,7 @@ class DailyCsvLogger:
         ros_seconds = (
             ""
             if ros_time_ns is None
-            else _seconds_string_from_ns(ros_time_ns)
+            else self._seconds_string_from_ns(ros_time_ns)
         )
 
         with self._lock:
