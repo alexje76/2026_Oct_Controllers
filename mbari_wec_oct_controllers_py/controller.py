@@ -17,6 +17,12 @@
 # limitations under the License.
 import threading
 import random
+import csv
+import os
+import time
+
+from datetime import timezone, datetime
+from pathlib import Path
 
 import numpy as np
 
@@ -25,6 +31,64 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.duration import Duration #For timing
 
 from buoy_api import Interface
+
+## Logging
+OUTPUT_DIR = os.path.exanduser("~/BuoyLogging")
+
+class DailyCsvLogger:
+    HEADER = ("timestamp", "event", "controller", "previous_controller")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._directory = Path(OUTPUT_DIR)
+        self._directory.mkdir(parents=True, exist_ok=True)
+
+        self._file = None
+        self._writer = None
+        self._day = None
+        self._last_flush = time.monotonic()
+        self._open_file(datetime.now(timezone.utc))
+
+    def _open_file(self, now):
+        if self._file:
+            self._file.flush()
+            self._file.close()
+
+        # Unique filename on every process restart, including restarts on
+        # the same UTC day.
+        stamp = now.strftime("%Y-%m-%d_%H%M%S_%fZ")
+        path = self._directory / f"controller_{stamp}.csv"
+
+        self._file = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(self.HEADER)
+        self._day = now.date()
+        self._last_flush = time.monotonic()
+
+    def log(self, event, controller, previous_controller="", flush=False):
+        now = datetime.now(timezone.utc)
+
+        with self._lock:
+            if now.date() != self._day:
+                self._open_file(now)
+
+            self._writer.writerow((
+                now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+                event,
+                controller,
+                previous_controller,
+            ))
+
+            if flush or time.monotonic() - self._last_flush >= 600:
+                self._file.flush()
+                self._last_flush = time.monotonic()
+
+    def close(self):
+        with self._lock:
+            if self._file:
+                self._file.flush()
+                self._file.close()
+                self._file = None
 
 class ControlPolicy(object):
     """Common for all control policies"""
@@ -52,7 +116,7 @@ class ControlPolicy(object):
                 self.state["range"] < spring_bound_lower or 
                 self.state["range"] > spring_bound_upper
             ):
-                self._logger.info(f"srping range inside piston bounding is:{self.state["range"]}")
+                self._logger.info(f"srping range inside piston bounding is:{self.state['range']}")
                 bounded_target["Value"] = 0.0
                 self._logger.info(f'Target piston bounded, Overwritten '
                                        'with 0.0 Wind Curr')
@@ -223,6 +287,8 @@ class Controller(Interface):
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self.state = {}
+        self._csv_logger = DailyCsvLogger()
+
         self.policies = {
             "stepwise_random_bounded": StepwiseRandomBoundedPolicy(self.get_logger()),
             "free_response": FreeResponsePolicy(self.get_logger()),
@@ -231,7 +297,18 @@ class Controller(Interface):
         self.active_policy_name = "free_response"
 
         self.set_params()
+
+        self._csv_logger.log(
+            event="controller_started",
+            controller=self.active_policy_name,
+            flush=True,
+        )
+
         self.add_on_set_parameters_callback(self.parameter_callback)
+        self._minute_log_timer = self.create_timer(
+            60.0,
+            self._log_controller_minute,
+        )
 
     @property
     def active_policy(self):
@@ -239,10 +316,14 @@ class Controller(Interface):
                 return self.policies[self.active_policy_name]
 
     def set_params(self):
-        self.declare_parameter(
-            "active_policy",
-            "free_response" #Default parameter
-            )
+        self.declare_parameter("active_policy", "free_response")
+
+        requested_policy = self.get_parameter("active_policy").value
+
+        if requested_policy not in self.policies:
+            raise ValueError(f"Unknown policy: {requested_policy}")
+
+        self.active_policy_name = requested_policy
 
     def parameter_callback(self, params):
         for param in params:
@@ -255,16 +336,46 @@ class Controller(Interface):
                     reason=f"Unknown policy: {param.value}",
                 )
 
+            swapped = None
+
             with self._policy_lock:
                 old_name = self.active_policy_name
+
                 if old_name != param.value:
                     self.policies[old_name].reset()
                     self.policies[param.value].reset()
                     self.active_policy_name = param.value
-                    self.get_logger().info(
-                        f"Switched policy from {old_name} -> {param.value}"
-                    )
+                    swapped = (old_name, param.value)
+
+            if swapped:
+                old_name, new_name = swapped
+
+                self.get_logger().info(
+                    f"Switched policy from {old_name} -> {new_name}"
+                )
+
+                self._csv_logger.log(
+                    event="controller_swapped",
+                    controller=new_name,
+                    previous_controller=old_name,
+                    flush=True,
+                )
+
         return SetParametersResult(successful=True)
+
+    def _log_controller_minute(self):
+        with self._policy_lock:
+            policy_name = self.active_policy_name
+
+        self._csv_logger.log(
+            event="controller_minute",
+            controller=policy_name,
+        )
+
+
+    def close(self):
+        self._minute_log_timer.cancel()
+        self._csv_logger.close()
 
         # set packet rates from controllers here
         # controller defaults to publishing @ 10Hz
@@ -376,6 +487,7 @@ def main():
     try:
         controller.spin()
     finally:
+        controller.close()
         controller.destroy_node()
         rclpy.shutdown()
 
