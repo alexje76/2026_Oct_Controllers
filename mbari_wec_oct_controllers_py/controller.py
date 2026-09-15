@@ -40,7 +40,7 @@ class DailyCsvLogger:
     HEADER = (
         "timestamp_utc",
         "wall_epoch_seconds",
-        "ros_epoch_seconds",
+        "ros_seconds",
         "event",
         "controller",
         "previous_controller",
