@@ -29,6 +29,7 @@ import numpy as np
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.duration import Duration #For timing
+from rclpy.parameter import Parameter
 
 from buoy_api import Interface
 
@@ -315,6 +316,14 @@ class Controller(Interface):
     def __init__(self):
         super().__init__('controller')
 
+        self.set_parameters([
+            Parameter(
+                'use_sim_time',
+                Parameter.Type.BOOL,
+                True,
+            ),
+        ])
+
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self.state = {}
@@ -404,12 +413,14 @@ class Controller(Interface):
                     f"Switched policy from {old_name} -> {new_name}"
                 )
 
-        self._log_csv(
-            event="controller_swapped",
-            controller=new_name,
-            previous_controller=old_name,
-            flush=True,
-        )
+                self._log_csv(
+                    event="controller_swapped",
+                    controller=new_name,
+                    previous_controller=old_name,
+                    flush=True,
+                )
+
+
 
         return SetParametersResult(successful=True)
 
