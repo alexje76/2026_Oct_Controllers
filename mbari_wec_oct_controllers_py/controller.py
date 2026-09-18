@@ -153,11 +153,11 @@ class ControlPolicy(object):
 
             if self.state["range"] > (spring_upper_end - ramp_range):
                 x = self.state["range"] - (spring_upper_end - ramp_range)
-                current = -max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
+                current = max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
                 
             elif self.state["range"] < (spring_lower_end + ramp_range):
                 x = spring_lower_end + ramp_range - self.state["range"]
-                current = max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
+                current = -max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
 
             else: 
                 pass
