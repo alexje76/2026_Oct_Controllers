@@ -142,20 +142,31 @@ class ControlPolicy(object):
     def piston_bounding(self, target):
         with self.lock:
             bounded_target = dict(target)
-            spring_bound_upper = 65 #NEED TO CHECK THAT THERE IS NOT INCHES CONVERSION NEEDED
-            spring_bound_lower = 15
-            if (
-                self.state["range"] < spring_bound_lower or 
-                self.state["range"] > spring_bound_upper
-            ):
-                self._logger.info(f"srping range inside piston bounding is:{self.state['range']}")
-                bounded_target["Value"] = 0.0
-                self._logger.info(f'Target piston bounded, Overwritten '
-                                       'with 0.0 Wind Curr')
-                #TODO add logging
-            else:
+            spring_upper_end = 80
+            spring_lower_end = 0
+
+            ramp_range = 12
+            ramp_buffer = 2
+            max_current = 35
+
+            current = 0.0
+
+            if self.state["range"] > (spring_upper_end - ramp_range):
+                x = self.state["range"] - (spring_upper_end - ramp_range)
+                current = -max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
+                
+            elif self.state["range"] < (spring_lower_end + ramp_range):
+                x = spring_lower_end + ramp_range - self.state["range"]
+                current = max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
+
+            else: 
                 pass
-            return bounded_target
+
+            if current != 0.0:
+                self._logger.info(f"srping range inside piston bounding is:{self.state['range']}")
+                bounded_target["Value"] = current
+                self._logger.info(f"Target piston bounded, Overwritten "
+                        f"with {current} Wind Curr")
 
     def update_params(self, now):
         """Placeholder update_params"""
