@@ -168,6 +168,8 @@ class ControlPolicy(object):
                 self._logger.info(f"Target piston bounded, Overwritten "
                         f"with {current} Wind Curr")
 
+            return bounded_target
+
     def update_params(self, now):
         """Placeholder update_params"""
         pass
