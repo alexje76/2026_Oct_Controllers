@@ -124,7 +124,7 @@ class DailyCsvLogger:
 class NextWavePredictionStore:
     """Thread-safe NextWave data shared by all NextWave policies."""
 
-    def __init__(self):
+    def __init__(self): 
         self._lock = threading.Lock()
         self._window_start_time = 0.0
         self._window_end_time = 0.0
@@ -380,50 +380,78 @@ class FreeResponsePolicy(ControlPolicy):
         pass
 
 class NextWaveSpringPolicy(ControlPolicy):
-    """Placeholder NextWave policy with timed pump/valve target assignment."""
+    """Apply a bounded bias current from the 0.5 s projected wave elevation."""
+
+    _METERS_TO_INCHES = 39.3701
+    _LOOK_AHEAD_SECONDS = 0.5
+    _MAX_PREDICTION_AGE_SECONDS = 10.0
+    _GAIN_AMPS_PER_INCH = 1.0 / 35.0
 
     def __init__(self, logger, nextwave_predictions):
         super().__init__(logger)
         self.nextwave_predictions = nextwave_predictions
-        self._pump_duration = Duration(seconds=60.0)
-        self._valve_duration = Duration(seconds=1.0)
-        self.reset()
+        self._piston_bounded = False #Binding for output not bias
+        self._target = {"Control Knob": "Bias Current", "Value": 0.0}
 
-    def update_params(self, now):
-        with self.lock:
-            if self._phase_started_at is None:
-                return
+        self._bias_current = 0.0
 
-            duration = (
-                self._pump_duration
-                if self._phase == "pump"
-                else self._valve_duration
-            )
-            if now - self._phase_started_at >= duration:
-                self._phase = "valve" if self._phase == "pump" else "pump"
-                self._phase_started_at = None
-                self._command_pending = True
+    @staticmethod
+    def _interpolate(times, elevations, query_time):
+        """Return None outside the prediction interval; interpolate within it."""
+        if times.size == 0 or times.size != elevations.size:
+            return None
+
+        order = np.argsort(times)
+        times = times[order]
+        elevations = elevations[order]
+        if query_time < times[0] or query_time > times[-1]:
+            return None
+
+        return float(np.interp(query_time, times, elevations))
 
     def target(self, state, now):
+        prediction = self.nextwave_predictions.snapshot()
+        now_seconds = now.nanoseconds / 1e9
+        prediction_age = now_seconds - prediction["arrival_time_seconds"]
+
+        if prediction_age < 0.0 or prediction_age > self._MAX_PREDICTION_AGE_SECONDS:
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        if prediction["has_dense_predictions"]:
+            times = prediction["dense_times"]
+            elevations = prediction["dense_elevations"]
+        else:
+            times = prediction["sparse_times"]
+            elevations = prediction["sparse_elevations"]
+
+        if times.size == 0:
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        # Preserve the prior controller's prediction-time convention:
+        # elapsed time since packet arrival, projected 0.5 s into the future.
+        query_time = times[0] + prediction_age + self._LOOK_AHEAD_SECONDS
+        predicted_elevation_m = self._interpolate(times, elevations, query_time)
+        if predicted_elevation_m is None:
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        predicted_range_inches = predicted_elevation_m * self._METERS_TO_INCHES
         with self.lock:
-            if not self._command_pending:
-                return {"Control Knob": "No Command Pause", "Value": 0.0}
+            measured_range_inches = self.state["range"]
 
-            if self._phase == "pump":
-                target = {"Control Knob": "Pump", "Value": 1.0}  # minutes
-            else:
-                target = {"Control Knob": "Valve", "Value": 1.0}  # seconds
+        # Note elevation and spring range have different physical zero points
+        error_inches = predicted_range_inches - measured_range_inches
 
-            # Start timing when this one-shot actuator command is issued.
-            self._command_pending = False
-            self._phase_started_at = now
-            return target
+        self._bias_current = np.clip(
+            self._GAIN_AMPS_PER_INCH * error_inches,
+            -1.0,
+            1.0,
+        )
+
+        return {"Control Knob": "Bias Current", "Value": float(self._bias_current)}
 
     def reset(self):
-        with self.lock:
-            self._phase = "pump"
-            self._phase_started_at = None
-            self._command_pending = True
+        self._bias_current
+        pass
 
 class Controller(Interface):
     """Shared buoy interface with swappable control policies"""
