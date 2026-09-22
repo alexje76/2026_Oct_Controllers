@@ -121,7 +121,64 @@ class DailyCsvLogger:
                 self._file.flush()
                 self._file.close()
                 self._file = None
+class NextWavePredictionStore:
+    """Thread-safe NextWave data shared by all NextWave policies."""
 
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._window_start_time = 0.0
+        self._window_end_time = 0.0
+        self._arrival_time_seconds = 0.0
+        self._sparse_times = np.array([])
+        self._sparse_elevations = np.array([])
+        self._has_dense_predictions = False
+        self._dense_times = np.array([])
+        self._dense_elevations = np.array([])
+
+    def update(self, data, arrival_time):
+        sparse_times = np.asarray([p.time for p in data.predictions], dtype=float)
+        sparse_elevations = np.asarray(
+            [p.elevation for p in data.predictions],
+            dtype=float,
+        )
+
+        if data.has_dense_predictions:
+            dense_times = np.asarray(data.dense_predictions_time, dtype=float)
+            dense_elevations = np.asarray(data.dense_predictions_z, dtype=float)
+        else:
+            dense_times = np.array([])
+            dense_elevations = np.array([])
+
+        has_dense_predictions = (
+            data.has_dense_predictions
+            and dense_times.size > 0
+            and dense_times.size == dense_elevations.size
+        )
+
+        with self._lock:
+            self._window_start_time = float(data.window_start_time)
+            self._window_end_time = float(data.window_end_time)
+            self._arrival_time_seconds = arrival_time.nanoseconds / 1e9
+            self._sparse_times = sparse_times
+            self._sparse_elevations = sparse_elevations
+            self._has_dense_predictions = has_dense_predictions
+            self._dense_times = dense_times
+            self._dense_elevations = dense_elevations
+
+    def snapshot(self):
+        """Return a consistent copy for use by a NextWave policy."""
+        with self._lock:
+            return {
+                "window_start_time": self._window_start_time,
+                "window_end_time": self._window_end_time,
+                "arrival_time_seconds": self._arrival_time_seconds,
+                "sparse_times": self._sparse_times.copy(),
+                "sparse_elevations": self._sparse_elevations.copy(),
+                "has_dense_predictions": self._has_dense_predictions,
+                "dense_times": self._dense_times.copy(),
+                "dense_elevations": self._dense_elevations.copy(),
+            }
+        
 class ControlPolicy(object):
     """Common for all control policies"""
     def __init__(self, logger):
@@ -322,6 +379,51 @@ class FreeResponsePolicy(ControlPolicy):
     def reset(self):
         pass
 
+class NextWaveSpringPolicy(ControlPolicy):
+    """Placeholder NextWave policy with timed pump/valve target assignment."""
+
+    def __init__(self, logger, nextwave_predictions):
+        super().__init__(logger)
+        self.nextwave_predictions = nextwave_predictions
+        self._pump_duration = Duration(seconds=60.0)
+        self._valve_duration = Duration(seconds=1.0)
+        self.reset()
+
+    def update_params(self, now):
+        with self.lock:
+            if self._phase_started_at is None:
+                return
+
+            duration = (
+                self._pump_duration
+                if self._phase == "pump"
+                else self._valve_duration
+            )
+            if now - self._phase_started_at >= duration:
+                self._phase = "valve" if self._phase == "pump" else "pump"
+                self._phase_started_at = None
+                self._command_pending = True
+
+    def target(self, state, now):
+        with self.lock:
+            if not self._command_pending:
+                return {"Control Knob": "No Command Pause", "Value": 0.0}
+
+            if self._phase == "pump":
+                target = {"Control Knob": "Pump", "Value": 1.0}  # minutes
+            else:
+                target = {"Control Knob": "Valve", "Value": 1.0}  # seconds
+
+            # Start timing when this one-shot actuator command is issued.
+            self._command_pending = False
+            self._phase_started_at = now
+            return target
+
+    def reset(self):
+        with self.lock:
+            self._phase = "pump"
+            self._phase_started_at = None
+            self._command_pending = True
 
 class Controller(Interface):
     """Shared buoy interface with swappable control policies"""
@@ -341,11 +443,16 @@ class Controller(Interface):
         self._state_lock = threading.Lock()
         self.state = {}
         self._csv_logger = DailyCsvLogger()
+        self.nextwave_predictions = NextWavePredictionStore()
 
         self.policies = {
             "stepwise_random_bounded": StepwiseRandomBoundedPolicy(self.get_logger()),
             "free_response": FreeResponsePolicy(self.get_logger()),
             "stepwise_integrated_bounded": StepwiseIntegratedBoundedPolicy(self.get_logger()),
+            "nextwave_spring": NextWaveSpringPolicy(
+                self.get_logger(),
+                self.nextwave_predictions,
+            ),
         }
         self.active_policy_name = "free_response"
 
@@ -489,6 +596,31 @@ class Controller(Interface):
         # Update class variables, get control policy target, send commands, etc.
         pass
 
+    def power_callback(self, data):
+        """Provide feedback of '/power_data' topic from Power Controller."""
+        # Update class variables, get control policy target, send commands, etc.
+        pass
+
+    def powerbuoy_callback(self, data):
+        """Provide feedback of '/powerbuoy_data' topic -- Aggregated data from all topics."""
+        # Update class variables, get control policy target, send commands, etc.
+        pass 
+
+    def prediction_callback(self, data):
+        """Ingest every NextWave packet, regardless of the active policy."""
+        self.nextwave_predictions.update(data, self.get_clock().now())
+
+        dense_count = (
+            len(data.dense_predictions_time)
+            if data.has_dense_predictions
+            else 0
+        )
+        self.get_logger().info(
+            f"[pred cb] window={data.window_start_time:.2f}-"
+            f"{data.window_end_time:.2f}s "
+            f"sparse={len(data.predictions)} dense={dense_count}"
+        )
+
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
         ## Updates for state variables ##
@@ -500,20 +632,11 @@ class Controller(Interface):
         ## Send out command
         self.send_command()
 
-    def power_callback(self, data):
-        """Provide feedback of '/power_data' topic from Power Controller."""
-        # Update class variables, get control policy target, send commands, etc.
-        pass
-
     def trefoil_callback(self, data):
         """Provide feedback of '/trefoil_data' topic from Trefoil Controller."""
         # Update class variables, get control policy target, send commands, etc.
         pass
 
-    def powerbuoy_callback(self, data):
-        """Provide feedback of '/powerbuoy_data' topic -- Aggregated data from all topics."""
-        # Update class variables, get control policy target, send commands, etc.
-        pass 
 
     def send_command(self):
         with self._state_lock: #Take state "screenshot"
@@ -544,6 +667,8 @@ class Controller(Interface):
                 self.send_pc_scale_command(target["Value"], blocking=False)
             case 'Retract':
                 self.send_pc_retract_command(target["Value"], blocking=False)
+            case 'No Command Pause': #Doesn't cancel previous commands 
+                pass
             case 'None':
                     self.send_pump_command(0.0, blocking=False)
                     self.send_valve_command(0.0, blocking=False)
