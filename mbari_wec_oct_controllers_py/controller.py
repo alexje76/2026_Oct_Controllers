@@ -62,8 +62,8 @@ class DailyCsvLogger:
             self._file.flush()
             self._file.close()
 
-        # Unique filename on every process restart, including restarts on
-        # the same UTC day.
+        # Unique filename on every process restart, including restarts 
+        # on the same UTC day.
         stamp = now.strftime("%Y-%m-%d_%H%M%S_%fZ")
         path = self._directory / f"controller_{stamp}.csv"
 
@@ -121,7 +121,64 @@ class DailyCsvLogger:
                 self._file.flush()
                 self._file.close()
                 self._file = None
+class NextWavePredictionStore:
+    """Thread-safe NextWave data shared by all NextWave policies."""
 
+    def __init__(self): 
+        self._lock = threading.Lock()
+        self._window_start_time = 0.0
+        self._window_end_time = 0.0
+        self._arrival_time_seconds = 0.0
+        self._sparse_times = np.array([])
+        self._sparse_elevations = np.array([])
+        self._has_dense_predictions = False
+        self._dense_times = np.array([])
+        self._dense_elevations = np.array([])
+
+    def update(self, data, arrival_time):
+        sparse_times = np.asarray([p.time for p in data.predictions], dtype=float)
+        sparse_elevations = np.asarray(
+            [p.elevation for p in data.predictions],
+            dtype=float,
+        )
+
+        if data.has_dense_predictions:
+            dense_times = np.asarray(data.dense_predictions_time, dtype=float)
+            dense_elevations = np.asarray(data.dense_predictions_z, dtype=float)
+        else:
+            dense_times = np.array([])
+            dense_elevations = np.array([])
+
+        has_dense_predictions = (
+            data.has_dense_predictions
+            and dense_times.size > 0
+            and dense_times.size == dense_elevations.size
+        )
+
+        with self._lock:
+            self._window_start_time = float(data.window_start_time)
+            self._window_end_time = float(data.window_end_time)
+            self._arrival_time_seconds = arrival_time.nanoseconds / 1e9
+            self._sparse_times = sparse_times
+            self._sparse_elevations = sparse_elevations
+            self._has_dense_predictions = has_dense_predictions
+            self._dense_times = dense_times
+            self._dense_elevations = dense_elevations
+
+    def snapshot(self):
+        """Return a consistent copy for use by a NextWave policy."""
+        with self._lock:
+            return {
+                "window_start_time": self._window_start_time,
+                "window_end_time": self._window_end_time,
+                "arrival_time_seconds": self._arrival_time_seconds,
+                "sparse_times": self._sparse_times.copy(),
+                "sparse_elevations": self._sparse_elevations.copy(),
+                "has_dense_predictions": self._has_dense_predictions,
+                "dense_times": self._dense_times.copy(),
+                "dense_elevations": self._dense_elevations.copy(),
+            }
+        
 class ControlPolicy(object):
     """Common for all control policies"""
     def __init__(self, logger):
@@ -130,45 +187,12 @@ class ControlPolicy(object):
         }
         self.lock = threading.Lock()
         self._logger = logger
-        #Default States for bounding
-        self._piston_bounded = False
 
     ## Updates for Spring Callback ##
     def update_range(self, value):
         with self.lock:
             self.state["range"] = float(value) * 39.3701 #Converts from m to in
 
-    ## Bounding for target ##
-    def piston_bounding(self, target):
-        with self.lock:
-            bounded_target = dict(target)
-            spring_upper_end = 80
-            spring_lower_end = 0
-
-            ramp_range = 12
-            ramp_buffer = 2
-            max_current = 35
-
-            current = 0.0
-
-            if self.state["range"] > (spring_upper_end - ramp_range):
-                x = self.state["range"] - (spring_upper_end - ramp_range)
-                current = max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
-                
-            elif self.state["range"] < (spring_lower_end + ramp_range):
-                x = spring_lower_end + ramp_range - self.state["range"]
-                current = -max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
-
-            else: 
-                pass
-
-            if current != 0.0:
-                self._logger.info(f"srping range inside piston bounding is:{self.state['range']}")
-                bounded_target["Value"] = current
-                self._logger.info(f"Target piston bounded, Overwritten "
-                        f"with {current} Wind Curr")
-
-            return bounded_target
 
     def update_params(self, now):
         """Placeholder update_params"""
@@ -187,7 +211,6 @@ class StepwiseRandomBoundedPolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
-        self._piston_bounded = True
 
         self._u_on = False # Control State
         self._u_range = 4.0 #Winding current amps
@@ -243,7 +266,6 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
-        self._piston_bounded = True
 
         self._u_on = False # Control State
         self._u_range = 35
@@ -305,7 +327,6 @@ class FreeResponsePolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
-        self._piston_bounded = True
 
         self._target = {
             "Control Knob": 'None',
@@ -322,6 +343,78 @@ class FreeResponsePolicy(ControlPolicy):
     def reset(self):
         pass
 
+class NextWaveSpringPolicy(ControlPolicy):
+    """Apply a bounded bias current from the 0.5 s projected wave elevation."""
+
+    _METERS_TO_INCHES = 39.3701
+    _LOOK_AHEAD_SECONDS = 0.5
+    _MAX_PREDICTION_AGE_SECONDS = 10.0
+    _GAIN_AMPS_PER_INCH = 1.0 / 35.0
+
+    def __init__(self, logger, nextwave_predictions):
+        super().__init__(logger)
+        self.nextwave_predictions = nextwave_predictions
+        self._target = {"Control Knob": "Bias Current", "Value": 0.0}
+
+        self._bias_current = 0.0
+
+    @staticmethod
+    def _interpolate(times, elevations, query_time):
+        """Return None outside the prediction interval; interpolate within it."""
+        if times.size == 0 or times.size != elevations.size:
+            return None
+
+        order = np.argsort(times)
+        times = times[order]
+        elevations = elevations[order]
+        if query_time < times[0] or query_time > times[-1]:
+            return None
+
+        return float(np.interp(query_time, times, elevations))
+
+    def target(self, state, now):
+        prediction = self.nextwave_predictions.snapshot()
+        now_seconds = now.nanoseconds / 1e9
+        prediction_age = now_seconds - prediction["arrival_time_seconds"]
+
+        if prediction_age < 0.0 or prediction_age > self._MAX_PREDICTION_AGE_SECONDS:
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        if prediction["has_dense_predictions"]:
+            times = prediction["dense_times"]
+            elevations = prediction["dense_elevations"]
+        else:
+            times = prediction["sparse_times"]
+            elevations = prediction["sparse_elevations"]
+
+        if times.size == 0:
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        # Preserve the prior controller's prediction-time convention:
+        # elapsed time since packet arrival, projected 0.5 s into the future.
+        query_time = times[0] + prediction_age + self._LOOK_AHEAD_SECONDS
+        predicted_elevation_m = self._interpolate(times, elevations, query_time)
+        if predicted_elevation_m is None:
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        predicted_range_inches = predicted_elevation_m * self._METERS_TO_INCHES
+        with self.lock:
+            measured_range_inches = self.state["range"]
+
+        # Note elevation and spring range have different physical zero points
+        error_inches = predicted_range_inches - measured_range_inches
+
+        self._bias_current = np.clip(
+            self._GAIN_AMPS_PER_INCH * error_inches,
+            -1.0,
+            1.0,
+        )
+
+        return {"Control Knob": "Bias Current", "Value": float(self._bias_current)}
+
+    def reset(self):
+        self._bias_current = 0.0
+        pass
 
 class Controller(Interface):
     """Shared buoy interface with swappable control policies"""
@@ -340,12 +433,19 @@ class Controller(Interface):
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self.state = {}
+        self._piston_range_inches = None
+        self._piston_soft_stop_enabled = True
         self._csv_logger = DailyCsvLogger()
+        self.nextwave_predictions = NextWavePredictionStore()
 
         self.policies = {
             "stepwise_random_bounded": StepwiseRandomBoundedPolicy(self.get_logger()),
             "free_response": FreeResponsePolicy(self.get_logger()),
             "stepwise_integrated_bounded": StepwiseIntegratedBoundedPolicy(self.get_logger()),
+            "nextwave_spring": NextWaveSpringPolicy(
+                self.get_logger(),
+                self.nextwave_predictions,
+            ),
         }
         self.active_policy_name = "free_response"
 
@@ -389,7 +489,11 @@ class Controller(Interface):
 
     def set_params(self):
         self.declare_parameter("active_policy", "free_response")
+        self.declare_parameter("piston_soft_stop_enabled", True)
 
+        self._piston_soft_stop_enabled = (
+            self.get_parameter("piston_soft_stop_enabled").value
+        )
         requested_policy = self.get_parameter("active_policy").value
 
         if requested_policy not in self.policies:
@@ -399,17 +503,34 @@ class Controller(Interface):
 
     def parameter_callback(self, params):
         for param in params:
-            if param.name != "active_policy":
-                continue
-
-            if param.value not in self.policies:
+            if (
+                param.name == "active_policy"
+                and param.value not in self.policies
+            ):
                 return SetParametersResult(
                     successful=False,
                     reason=f"Unknown policy: {param.value}",
                 )
 
-            swapped = None
+            if (
+                param.name == "piston_soft_stop_enabled"
+                and not isinstance(param.value, bool)
+            ):
+                return SetParametersResult(
+                    successful=False,
+                    reason="piston_soft_stop_enabled must be a boolean",
+                )
 
+        for param in params:
+            if param.name == "piston_soft_stop_enabled":
+                with self._state_lock:
+                    self._piston_soft_stop_enabled = param.value
+                continue
+
+            if param.name != "active_policy":
+                continue
+
+            swapped = None
             with self._policy_lock:
                 old_name = self.active_policy_name
 
@@ -421,11 +542,9 @@ class Controller(Interface):
 
             if swapped:
                 old_name, new_name = swapped
-
                 self.get_logger().info(
                     f"Switched policy from {old_name} -> {new_name}"
                 )
-
                 self._log_csv(
                     event="controller_swapped",
                     controller=new_name,
@@ -433,9 +552,50 @@ class Controller(Interface):
                     flush=True,
                 )
 
-
-
         return SetParametersResult(successful=True)
+
+    def piston_bounding(self, target):
+        """Override any policy target with winding current near stroke limits."""
+        with self._state_lock:
+            piston_range = self._piston_range_inches
+            enabled = self._piston_soft_stop_enabled
+
+        if not enabled or piston_range is None:
+            return target, False
+
+        spring_upper_end = 80 #in
+        spring_lower_end = 0 #in
+        ramp_range = 12 #in
+        ramp_buffer = 2 #in
+        max_current = 35 #A
+        current = 0.0 #A
+
+        if piston_range > spring_upper_end - ramp_range:
+            x = piston_range - (spring_upper_end - ramp_range)
+            current = max_current * max(
+                0.0,
+                min(1.0, x / (ramp_range - ramp_buffer)),
+            )
+        elif piston_range < spring_lower_end + ramp_range:
+            x = spring_lower_end + ramp_range - piston_range
+            current = -max_current * max(
+                0.0,
+                min(1.0, x / (ramp_range - ramp_buffer)),
+            )
+
+        if current == 0.0:
+            return target, False
+
+        self.get_logger().info(
+            f"spring range inside piston bounding is: {piston_range}"
+        )
+        self.get_logger().info(
+            f"Target piston bounded, overwritten with {current} winding current"
+        )
+        return {
+            "Control Knob": "Winding Current",
+            "Value": current,
+        }, abs(current) >= max_current
 
     def _log_controller_minute(self):
         with self._policy_lock:
@@ -489,24 +649,8 @@ class Controller(Interface):
         # Update class variables, get control policy target, send commands, etc.
         pass
 
-    def spring_callback(self, data):
-        """Provide feedback of '/spring_data' topic from Spring Controller."""
-        ## Updates for state variables ##
-        self.active_policy.update_range(data.range_finder)
-
-        ## Update the policy as needed
-        self.active_policy.update_params(self.get_clock().now())
-
-        ## Send out command
-        self.send_command()
-
     def power_callback(self, data):
         """Provide feedback of '/power_data' topic from Power Controller."""
-        # Update class variables, get control policy target, send commands, etc.
-        pass
-
-    def trefoil_callback(self, data):
-        """Provide feedback of '/trefoil_data' topic from Trefoil Controller."""
         # Update class variables, get control policy target, send commands, etc.
         pass
 
@@ -514,6 +658,41 @@ class Controller(Interface):
         """Provide feedback of '/powerbuoy_data' topic -- Aggregated data from all topics."""
         # Update class variables, get control policy target, send commands, etc.
         pass 
+
+    def prediction_callback(self, data):
+        """Ingest every NextWave packet, regardless of the active policy."""
+        self.nextwave_predictions.update(data, self.get_clock().now())
+
+        dense_count = (
+            len(data.dense_predictions_time)
+            if data.has_dense_predictions
+            else 0
+        )
+        self.get_logger().info(
+            f"[pred cb] window={data.window_start_time:.2f}-"
+            f"{data.window_end_time:.2f}s "
+            f"sparse={len(data.predictions)} dense={dense_count}"
+        )
+
+    def spring_callback(self, data):
+        """Provide feedback of '/spring_data' topic from Spring Controller."""
+        piston_range_inches = float(data.range_finder) * 39.3701
+
+        with self._state_lock:
+            self._piston_range_inches = piston_range_inches
+
+        ## Update
+        self.active_policy.update_range(data.range_finder)
+        self.active_policy.update_params(self.get_clock().now())
+
+        ## Send out command
+        self.send_command()
+
+    def trefoil_callback(self, data):
+        """Provide feedback of '/trefoil_data' topic from Trefoil Controller."""
+        # Update class variables, get control policy target, send commands, etc.
+        pass
+
 
     def send_command(self):
         with self._state_lock: #Take state "screenshot"
@@ -524,9 +703,10 @@ class Controller(Interface):
         now = self.get_clock().now()
 
         target  = policy.target(state, now) #Get target with screenshot
+        target, clear_bias_current = self.piston_bounding(target)
 
-        if policy._piston_bounded:
-            target = policy.piston_bounding(target)
+        if clear_bias_current:
+            self.send_pc_bias_curr_command(0.0, blocking=False)
 
         self.get_logger().info(
             f"{self.active_policy_name} sending {target['Control Knob']} value {target['Value']}"
@@ -544,6 +724,8 @@ class Controller(Interface):
                 self.send_pc_scale_command(target["Value"], blocking=False)
             case 'Retract':
                 self.send_pc_retract_command(target["Value"], blocking=False)
+            case 'No Command Pause': #Doesn't cancel previous commands 
+                pass
             case 'None':
                     self.send_pump_command(0.0, blocking=False)
                     self.send_valve_command(0.0, blocking=False)
