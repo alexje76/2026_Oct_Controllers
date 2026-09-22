@@ -62,8 +62,8 @@ class DailyCsvLogger:
             self._file.flush()
             self._file.close()
 
-        # Unique filename on every process restart, including restarts on
-        # the same UTC day.
+        # Unique filename on every process restart, including restarts 
+        # on the same UTC day.
         stamp = now.strftime("%Y-%m-%d_%H%M%S_%fZ")
         path = self._directory / f"controller_{stamp}.csv"
 
@@ -187,45 +187,12 @@ class ControlPolicy(object):
         }
         self.lock = threading.Lock()
         self._logger = logger
-        #Default States for bounding
-        self._piston_bounded = False
 
     ## Updates for Spring Callback ##
     def update_range(self, value):
         with self.lock:
             self.state["range"] = float(value) * 39.3701 #Converts from m to in
 
-    ## Bounding for target ##
-    def piston_bounding(self, target):
-        with self.lock:
-            bounded_target = dict(target)
-            spring_upper_end = 80
-            spring_lower_end = 0
-
-            ramp_range = 12
-            ramp_buffer = 2
-            max_current = 35
-
-            current = 0.0
-
-            if self.state["range"] > (spring_upper_end - ramp_range):
-                x = self.state["range"] - (spring_upper_end - ramp_range)
-                current = max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
-                
-            elif self.state["range"] < (spring_lower_end + ramp_range):
-                x = spring_lower_end + ramp_range - self.state["range"]
-                current = -max_current * max(0.0, min(1.0, x / (ramp_range - ramp_buffer)))
-
-            else: 
-                pass
-
-            if current != 0.0:
-                self._logger.info(f"srping range inside piston bounding is:{self.state['range']}")
-                bounded_target["Value"] = current
-                self._logger.info(f"Target piston bounded, Overwritten "
-                        f"with {current} Wind Curr")
-
-            return bounded_target
 
     def update_params(self, now):
         """Placeholder update_params"""
@@ -244,7 +211,6 @@ class StepwiseRandomBoundedPolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
-        self._piston_bounded = True
 
         self._u_on = False # Control State
         self._u_range = 4.0 #Winding current amps
@@ -300,7 +266,6 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
-        self._piston_bounded = True
 
         self._u_on = False # Control State
         self._u_range = 35
@@ -362,7 +327,6 @@ class FreeResponsePolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
-        self._piston_bounded = True
 
         self._target = {
             "Control Knob": 'None',
@@ -390,7 +354,6 @@ class NextWaveSpringPolicy(ControlPolicy):
     def __init__(self, logger, nextwave_predictions):
         super().__init__(logger)
         self.nextwave_predictions = nextwave_predictions
-        self._piston_bounded = False #Binding for output not bias
         self._target = {"Control Knob": "Bias Current", "Value": 0.0}
 
         self._bias_current = 0.0
@@ -450,7 +413,7 @@ class NextWaveSpringPolicy(ControlPolicy):
         return {"Control Knob": "Bias Current", "Value": float(self._bias_current)}
 
     def reset(self):
-        self._bias_current
+        self._bias_current = 0.0
         pass
 
 class Controller(Interface):
@@ -470,6 +433,8 @@ class Controller(Interface):
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self.state = {}
+        self._piston_range_inches = None
+        self._piston_soft_stop_enabled = True
         self._csv_logger = DailyCsvLogger()
         self.nextwave_predictions = NextWavePredictionStore()
 
@@ -524,7 +489,11 @@ class Controller(Interface):
 
     def set_params(self):
         self.declare_parameter("active_policy", "free_response")
+        self.declare_parameter("piston_soft_stop_enabled", True)
 
+        self._piston_soft_stop_enabled = (
+            self.get_parameter("piston_soft_stop_enabled").value
+        )
         requested_policy = self.get_parameter("active_policy").value
 
         if requested_policy not in self.policies:
@@ -534,17 +503,34 @@ class Controller(Interface):
 
     def parameter_callback(self, params):
         for param in params:
-            if param.name != "active_policy":
-                continue
-
-            if param.value not in self.policies:
+            if (
+                param.name == "active_policy"
+                and param.value not in self.policies
+            ):
                 return SetParametersResult(
                     successful=False,
                     reason=f"Unknown policy: {param.value}",
                 )
 
-            swapped = None
+            if (
+                param.name == "piston_soft_stop_enabled"
+                and not isinstance(param.value, bool)
+            ):
+                return SetParametersResult(
+                    successful=False,
+                    reason="piston_soft_stop_enabled must be a boolean",
+                )
 
+        for param in params:
+            if param.name == "piston_soft_stop_enabled":
+                with self._state_lock:
+                    self._piston_soft_stop_enabled = param.value
+                continue
+
+            if param.name != "active_policy":
+                continue
+
+            swapped = None
             with self._policy_lock:
                 old_name = self.active_policy_name
 
@@ -556,11 +542,9 @@ class Controller(Interface):
 
             if swapped:
                 old_name, new_name = swapped
-
                 self.get_logger().info(
                     f"Switched policy from {old_name} -> {new_name}"
                 )
-
                 self._log_csv(
                     event="controller_swapped",
                     controller=new_name,
@@ -568,9 +552,50 @@ class Controller(Interface):
                     flush=True,
                 )
 
-
-
         return SetParametersResult(successful=True)
+
+    def piston_bounding(self, target):
+        """Override any policy target with winding current near stroke limits."""
+        with self._state_lock:
+            piston_range = self._piston_range_inches
+            enabled = self._piston_soft_stop_enabled
+
+        if not enabled or piston_range is None:
+            return target, False
+
+        spring_upper_end = 80 #in
+        spring_lower_end = 0 #in
+        ramp_range = 12 #in
+        ramp_buffer = 2 #in
+        max_current = 35 #A
+        current = 0.0 #A
+
+        if piston_range > spring_upper_end - ramp_range:
+            x = piston_range - (spring_upper_end - ramp_range)
+            current = max_current * max(
+                0.0,
+                min(1.0, x / (ramp_range - ramp_buffer)),
+            )
+        elif piston_range < spring_lower_end + ramp_range:
+            x = spring_lower_end + ramp_range - piston_range
+            current = -max_current * max(
+                0.0,
+                min(1.0, x / (ramp_range - ramp_buffer)),
+            )
+
+        if current == 0.0:
+            return target, False
+
+        self.get_logger().info(
+            f"spring range inside piston bounding is: {piston_range}"
+        )
+        self.get_logger().info(
+            f"Target piston bounded, overwritten with {current} winding current"
+        )
+        return {
+            "Control Knob": "Winding Current",
+            "Value": current,
+        }, abs(current) >= max_current
 
     def _log_controller_minute(self):
         with self._policy_lock:
@@ -651,10 +676,13 @@ class Controller(Interface):
 
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
-        ## Updates for state variables ##
-        self.active_policy.update_range(data.range_finder)
+        piston_range_inches = float(data.range_finder) * 39.3701
 
-        ## Update the policy as needed
+        with self._state_lock:
+            self._piston_range_inches = piston_range_inches
+
+        ## Update
+        self.active_policy.update_range(data.range_finder)
         self.active_policy.update_params(self.get_clock().now())
 
         ## Send out command
@@ -675,9 +703,10 @@ class Controller(Interface):
         now = self.get_clock().now()
 
         target  = policy.target(state, now) #Get target with screenshot
+        target, clear_bias_current = self.piston_bounding(target)
 
-        if policy._piston_bounded:
-            target = policy.piston_bounding(target)
+        if clear_bias_current:
+            self.send_pc_bias_curr_command(0.0, blocking=False)
 
         self.get_logger().info(
             f"{self.active_policy_name} sending {target['Control Knob']} value {target['Value']}"
