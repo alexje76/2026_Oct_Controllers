@@ -36,6 +36,53 @@ from buoy_api import Interface
 ## Logging
 OUTPUT_DIR = os.path.expanduser("~/BuoyLogging")
 
+NEXTWAVE_HEADER = (
+    "timestamp_utc",
+    "wall_epoch_seconds",
+    "ros_seconds",
+    "event",
+    "window_start_time",
+    "window_end_time",
+    "n_measurements",
+    "n_windows",
+    "solve_time_min_s",
+    "solve_time_max_s",
+    "solve_time_avg_s",
+    "solver_error",
+    "solver_objective",
+    "num_wavelengths",
+    "has_wavespec_bulk",
+    "wavespec_hs",
+    "wavespec_tp",
+    "wavespec_tm01",
+    "wavespec_tm02",
+    "wavespec_dp",
+    "wavespec_dm",
+    "wavespec_spreadp",
+    "forecast_skill_mean",
+    "forecast_skill_lead_sec",
+    "forecast_skill_n_scored",
+    "forecast_skill_buoy_0",
+    "forecast_skill_buoy_1",
+    "forecast_skill_buoy_2",
+    "forecast_skill_buoy_3",
+)
+
+
+def _fmt_opt(value):
+    """Formatting: return the value as-is, or '' for None/NaN so CSV 
+    rows never contain 'nan'."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and np.isnan(value):
+        return ""
+    return value
+
+
+def _blank_extras():
+    """Matches NEXTWAVE_HEADER[4:] columns"""
+    return tuple("" for _ in NEXTWAVE_HEADER[4:])
+
 class DailyCsvLogger:
     HEADER = (
         "timestamp_utc",
@@ -46,10 +93,13 @@ class DailyCsvLogger:
         "previous_controller",
     )
 
-    def __init__(self):
+    def __init__(self, prefix="controller", header=None):
         self._lock = threading.Lock()
         self._directory = Path(OUTPUT_DIR)
         self._directory.mkdir(parents=True, exist_ok=True)
+
+        self._prefix = prefix #Assumses controller log^
+        self._header = header if header is not None else self.HEADER
 
         self._file = None
         self._writer = None
@@ -58,18 +108,18 @@ class DailyCsvLogger:
         self._open_file(datetime.now(timezone.utc))
 
     def _open_file(self, now):
-        if self._file:
+        if self._file: 
             self._file.flush()
             self._file.close()
 
         # Unique filename on every process restart, including restarts 
         # on the same UTC day.
         stamp = now.strftime("%Y-%m-%d_%H%M%S_%fZ")
-        path = self._directory / f"controller_{stamp}.csv"
+        path = self._directory / f"{self._prefix}_{stamp}.csv"
 
         self._file = open(path, "w", newline="", encoding="utf-8")
         self._writer = csv.writer(self._file)
-        self._writer.writerow(self.HEADER)
+        self._writer.writerow(self._header)
         self._day = now.date()
         self._last_flush = time.monotonic()
 
@@ -77,14 +127,7 @@ class DailyCsvLogger:
         seconds, nanoseconds = divmod(int(ns), 1_000_000_000)
         return f"{seconds}.{nanoseconds:09d}"
 
-    def log(
-        self,
-        event,
-        controller,
-        previous_controller="",
-        ros_time_ns=None,
-        flush=False,
-    ):
+    def _write_row(self, row, ros_time_ns, flush):
         wall_time_ns = time.time_ns()
         wall_seconds = self._seconds_string_from_ns(wall_time_ns)
         now = datetime.fromtimestamp(
@@ -102,18 +145,30 @@ class DailyCsvLogger:
             if now.date() != self._day:
                 self._open_file(now)
 
-            self._writer.writerow((
-                now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
-                wall_seconds,
-                ros_seconds,
-                event,
-                controller,
-                previous_controller,
-            ))
+            self._writer.writerow(
+                (
+                    now.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                    wall_seconds,
+                    ros_seconds,
+                ) + tuple(row)
+            )
 
             if flush or time.monotonic() - self._last_flush >= 600:
                 self._file.flush()
                 self._last_flush = time.monotonic()
+
+    def log(
+        self,
+        event,
+        controller,
+        previous_controller="",
+        ros_time_ns=None,
+        flush=False,
+    ):
+        self._write_row((event, controller, previous_controller), ros_time_ns, flush)
+
+    def log_row(self, event, extras=(), ros_time_ns=None, flush=False):
+        self._write_row((event,) + tuple(extras), ros_time_ns, flush)
 
     def close(self):
         with self._lock:
@@ -121,6 +176,7 @@ class DailyCsvLogger:
                 self._file.flush()
                 self._file.close()
                 self._file = None
+
 class NextWavePredictionStore:
     """Thread-safe NextWave data shared by all NextWave policies."""
 
@@ -436,6 +492,16 @@ class Controller(Interface):
         self._piston_range_inches = None
         self._piston_soft_stop_enabled = True
         self._csv_logger = DailyCsvLogger()
+
+        self._nextwave_logger = DailyCsvLogger(prefix="nextwave", header=NEXTWAVE_HEADER)
+        self._nextwave_lock = threading.Lock()
+        self._nextwave_last = {}          # latest-window scalars (msg fields)
+        self._nextwave_solve_times = []   # buffered data.solve_time per window
+        self._nextwave_skills = []        # buffered data.forecast_skill per window
+        self._nextwave_buoys = []         # buffered data.forecast_skill_by_buoy arrays
+        self._nextwave_state = "pre_window_fill"  # pre_window_fill | running | not_running
+        self._nextwave_last_arrival = None        # ROS seconds of last prediction
+        self._nextwave_last_summary = None        # ROS seconds of last summary row
         self.nextwave_predictions = NextWavePredictionStore()
 
         self.policies = {
@@ -456,6 +522,10 @@ class Controller(Interface):
             controller=self.active_policy_name,
             flush=True,
         )
+
+        self._nextwave_emit("nextwave_pre_window_fill", _blank_extras(), flush=True)
+        self._nextwave_last_summary = self.get_clock().now().nanoseconds / 1e9
+        self._nextwave_periodic_timer = self.create_timer(5.0, self._nextwave_periodic)
 
         self.add_on_set_parameters_callback(self.parameter_callback)
         self._minute_log_timer = self.create_timer(
@@ -482,12 +552,133 @@ class Controller(Interface):
             flush=flush,
         )
 
+    def _nextwave_emit(self, event, extras, flush=False):
+        """Write one row to nextwave_*.csv at the current ROS time."""
+        self._nextwave_logger.log_row(
+            event=event,
+            extras=extras,
+            ros_time_ns=self.get_clock().now().nanoseconds,
+            flush=flush,
+        )
+
+    def _nextwave_arrival(self, data):
+        """Per-prediction bookkeeping: state transition, snapshot, buffers."""
+        now = self.get_clock().now().nanoseconds / 1e9
+        with self._nextwave_lock:
+            was_running = self._nextwave_state == "running"
+            self._nextwave_state = "running"
+            self._nextwave_last_arrival = now
+
+            self._nextwave_solve_times.append(float(data.solve_time))
+            self._nextwave_skills.append(data.forecast_skill)
+            buoy = np.asarray(data.forecast_skill_by_buoy, dtype=float)
+            if buoy.size:
+                self._nextwave_buoys.append(buoy)
+
+            self._nextwave_last.update(
+                window_start_time=data.window_start_time,
+                window_end_time=data.window_end_time,
+                n_measurements=data.n_measurements,
+                solver_error=data.solver_error,
+                solver_objective=data.solver_objective,
+                num_wavelengths=data.num_wavelengths,
+                has_wavespec_bulk=data.has_wavespec_bulk,
+                wavespec_hs=data.wavespec_hs,
+                wavespec_tp=data.wavespec_tp,
+                wavespec_tm01=data.wavespec_tm01,
+                wavespec_tm02=data.wavespec_tm02,
+                wavespec_dp=data.wavespec_dp,
+                wavespec_dm=data.wavespec_dm,
+                wavespec_spreadp=data.wavespec_spreadp,
+                forecast_skill_lead_sec=data.forecast_skill_lead_sec,
+                forecast_skill_n_scored=data.forecast_skill_n_scored,
+            )
+
+        if not was_running:
+            self._nextwave_emit("nextwave_running", _blank_extras(), flush=True)
+
+    def _nextwave_periodic(self):
+        """5 s tick: stale-feed watchdog, then summary-due check."""
+        now = self.get_clock().now().nanoseconds / 1e9
+        emit_state = None
+        emit_summary = False
+        with self._nextwave_lock:
+            if (
+                self._nextwave_state == "running"
+                and self._nextwave_last_arrival is not None
+                and now - self._nextwave_last_arrival > self._nextwave_stale_sec
+            ):
+                self._nextwave_state = "not_running"
+                emit_state = "nextwave_not_running"
+            if now - self._nextwave_last_summary >= self._nextwave_log_interval_sec:
+                emit_summary = True
+
+        if emit_state:
+            self._nextwave_emit(emit_state, _blank_extras(), flush=True)
+        if emit_summary:
+            self._nextwave_summary()
+
+    def _nextwave_summary(self):
+        """Aggregate one interval's buffers into a summary row, then reset them."""
+        now = self.get_clock().now().nanoseconds / 1e9
+        with self._nextwave_lock:
+            last = self._nextwave_last
+            extras = list(_blank_extras())
+
+            solve_times = np.asarray(self._nextwave_solve_times)
+            skills = np.asarray(self._nextwave_skills)
+            buoys = (
+                np.vstack(self._nextwave_buoys) if self._nextwave_buoys else None
+            )
+
+            # context + solve histogram (extras 0-9)
+            extras[0] = _fmt_opt(last.get("window_start_time"))
+            extras[1] = _fmt_opt(last.get("window_end_time"))
+            extras[2] = _fmt_opt(last.get("n_measurements"))
+            extras[3] = solve_times.size if solve_times.size else ""
+            extras[4] = _fmt_opt(solve_times.min()) if solve_times.size else ""
+            extras[5] = _fmt_opt(solve_times.max()) if solve_times.size else ""
+            extras[6] = _fmt_opt(solve_times.mean()) if solve_times.size else ""
+            extras[7] = _fmt_opt(last.get("solver_error"))
+            extras[8] = _fmt_opt(last.get("solver_objective"))
+            extras[9] = _fmt_opt(last.get("num_wavelengths"))
+
+            # bulk sea state (extras 10-17), guarded by has_wavespec_bulk
+            if last.get("has_wavespec_bulk"):
+                extras[10] = 1
+                for i, key in enumerate((
+                    "wavespec_hs", "wavespec_tp", "wavespec_tm01",
+                    "wavespec_tm02", "wavespec_dp", "wavespec_dm",
+                    "wavespec_spreadp",
+                )):
+                    extras[11 + i] = _fmt_opt(last.get(key))
+
+            # forecast skill (extras 18-24)
+            if skills.size and not np.all(np.isnan(skills)):
+                extras[18] = _fmt_opt(float(np.nanmean(skills)))
+            extras[19] = _fmt_opt(last.get("forecast_skill_lead_sec"))
+            extras[20] = _fmt_opt(last.get("forecast_skill_n_scored"))
+            if buoys is not None and buoys.shape[1] <= 4:
+                for j in range(buoys.shape[1]):
+                    col = buoys[:, j]
+                    mean = float(np.nanmean(col)) if np.any(~np.isnan(col)) else np.nan
+                    extras[21 + j] = _fmt_opt(mean)
+
+            # reset buffers for the next interval
+            self._nextwave_solve_times = []
+            self._nextwave_skills = []
+            self._nextwave_buoys = []
+            self._nextwave_last_summary = now
+
+        self._nextwave_emit("nextwave_summary", tuple(extras), flush=True)
+
     @property
     def active_policy(self):
             with self._policy_lock:
                 return self.policies[self.active_policy_name]
 
     def set_params(self):
+        #Policy logging Params
         self.declare_parameter("active_policy", "free_response")
         self.declare_parameter("piston_soft_stop_enabled", True)
 
@@ -500,6 +691,16 @@ class Controller(Interface):
             raise ValueError(f"Unknown policy: {requested_policy}")
 
         self.active_policy_name = requested_policy
+
+        #NextWave logging Params
+        self.declare_parameter("nextwave_log_interval_sec", 60.0)
+        self.declare_parameter("nextwave_stale_sec", 20.0)
+        self._nextwave_log_interval_sec = float(
+            self.get_parameter("nextwave_log_interval_sec").value
+        )
+        self._nextwave_stale_sec = float(
+            self.get_parameter("nextwave_stale_sec").value
+        )
 
     def parameter_callback(self, params):
         for param in params:
@@ -610,6 +811,8 @@ class Controller(Interface):
     def close(self):
         self._minute_log_timer.cancel()
         self._csv_logger.close()
+        self._nextwave_periodic_timer.cancel()
+        self._nextwave_logger.close()
 
         # set packet rates from controllers here
         # controller defaults to publishing @ 10Hz
@@ -662,7 +865,9 @@ class Controller(Interface):
     def prediction_callback(self, data):
         """Ingest every NextWave packet, regardless of the active policy."""
         self.nextwave_predictions.update(data, self.get_clock().now())
+        self._nextwave_arrival(data)
 
+        #Keeps output logging for visability
         dense_count = (
             len(data.dense_predictions_time)
             if data.has_dense_predictions
