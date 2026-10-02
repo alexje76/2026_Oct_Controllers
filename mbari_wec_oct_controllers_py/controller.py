@@ -238,24 +238,15 @@ class NextWavePredictionStore:
 class ControlPolicy(object):
     """Common for all control policies"""
     def __init__(self, logger):
-        self.state = {
-            "range": 0.0,
-        }
         self.lock = threading.Lock()
         self._logger = logger
-
-    ## Updates for Spring Callback ##
-    def update_range(self, value):
-        with self.lock:
-            self.state["range"] = float(value) * 39.3701 #Converts from m to in
-
 
     def update_params(self, now):
         """Placeholder update_params"""
         pass
 
     def reset(self):
-        """Reset state when entering/leaving control mode"""
+        """Placeholder reset state when entering/leaving control mode"""
         pass
 
 ################## Control Policies ###################################
@@ -458,12 +449,17 @@ class NextWaveSpringPolicy(ControlPolicy):
         if predicted_elevation_m is None:
             return {"Control Knob": "Bias Current", "Value": 0.0}
 
+        # Convert the NextWave prediction from meters to inches.
         predicted_range_inches = predicted_elevation_m * self._METERS_TO_INCHES
-        with self.lock:
-            measured_range_inches = self.state["range"]
 
-        # Note elevation and spring range have different physical zero points
-        error_inches = predicted_range_inches - measured_range_inches
+        measured_range_inches = state.get("range") #Stored in inches
+        #Check range, fallback if non or not finite
+        if measured_range_inches is None or not np.isfinite(measured_range_inches):
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        #Error between predicted range and piston position (intentionally ignores
+        # the discrepancy of heave cone)
+        error_inches = predicted_range_inches - float(measured_range_inches)
 
         self._bias_current = np.clip(
             self._GAIN_AMPS_PER_INCH * error_inches,
@@ -544,8 +540,8 @@ class Controller(Interface):
         self._state_lock = threading.Lock()
         self.state = {
             "rpm": 0.0,
+            "range": None, #Stored in inches
         }
-        self._piston_range_inches = None
         self._piston_soft_stop_enabled = False
         self._csv_logger = DailyCsvLogger()
 
@@ -902,7 +898,8 @@ class Controller(Interface):
     def piston_bounding(self, target):
         """Override any policy target with winding current near stroke limits."""
         with self._state_lock:
-            piston_range = self._piston_range_inches
+            # Controller.state["range"] is stored in inches.
+            piston_range = self.state.get("range")
             enabled = self._piston_soft_stop_enabled
 
         if not enabled or piston_range is None:
@@ -1031,16 +1028,15 @@ class Controller(Interface):
 
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
+        # Store spring message range in inches.
         piston_range_inches = float(data.range_finder) * 39.3701
 
         with self._state_lock:
-            self._piston_range_inches = piston_range_inches
+            self.state["range"] = piston_range_inches
 
-        ## Update
-        self.active_policy.update_range(data.range_finder)
         self.active_policy.update_params(self.get_clock().now())
 
-        ## Send out command if not in linear damping mode
+        # Send out command if not in linear damping mode.
         with self._policy_lock:
             linear_damper_active = self.active_policy_name == "linear_damper"
 
