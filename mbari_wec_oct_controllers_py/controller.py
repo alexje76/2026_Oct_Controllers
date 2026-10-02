@@ -319,6 +319,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
        Control that provides stepwise random control inputs 
         on an integrated interval
        Is bounded by piston stroke 
+       Has the max current as a parameter
     """
     def __init__(self, logger):
         super().__init__(logger)
@@ -365,6 +366,10 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
                     self._swap_time = now
                 else:
                     pass
+
+    def set_u_range(self, value):
+        with self.lock:
+            self._u_range = float(value)
 
     def target(self, state, now):
         self._target["Value"] = self.u
@@ -490,7 +495,7 @@ class Controller(Interface):
         self._state_lock = threading.Lock()
         self.state = {}
         self._piston_range_inches = None
-        self._piston_soft_stop_enabled = True
+        self._piston_soft_stop_enabled = False
         self._csv_logger = DailyCsvLogger()
 
         self._nextwave_logger = DailyCsvLogger(prefix="nextwave", header=NEXTWAVE_HEADER)
@@ -680,7 +685,12 @@ class Controller(Interface):
     def set_params(self):
         #Policy logging Params
         self.declare_parameter("active_policy", "free_response")
-        self.declare_parameter("piston_soft_stop_enabled", True)
+        self.declare_parameter("piston_soft_stop_enabled", False)
+        self.declare_parameter("stepwise_integrated_u_range", 35.0)
+
+        self.policies["stepwise_integrated_bounded"].set_u_range(
+            self.get_parameter("stepwise_integrated_u_range").value
+        )
 
         self._piston_soft_stop_enabled = (
             self.get_parameter("piston_soft_stop_enabled").value
@@ -721,11 +731,31 @@ class Controller(Interface):
                     successful=False,
                     reason="piston_soft_stop_enabled must be a boolean",
                 )
+            if param.name == "stepwise_integrated_u_range":
+                try:
+                    u_range = float(param.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False,
+                        reason="stepwise_integrated_u_range must be a number",
+                    )
+
+                if not np.isfinite(u_range) or u_range < 0.0 or u_range > 35.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="stepwise_integrated_u_range must be between 0 and 35",
+                    )
 
         for param in params:
             if param.name == "piston_soft_stop_enabled":
                 with self._state_lock:
                     self._piston_soft_stop_enabled = param.value
+                continue
+
+            if param.name == "stepwise_integrated_u_range":
+                self.policies["stepwise_integrated_bounded"].set_u_range(
+                    param.value
+                )
                 continue
 
             if param.name != "active_policy":
