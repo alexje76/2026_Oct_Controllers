@@ -566,7 +566,7 @@ class Controller(Interface):
             ),
             "linear_damper": LinearDamperPolicy(self.get_logger()),
         }
-        self.active_policy_name = "free_response"
+        self.active_policy_name = "linear_damper"
 
         self.set_params()
 
@@ -824,7 +824,7 @@ class Controller(Interface):
                         reason=f"{param.name} must be a number",
                     )
 
-                if not np.isfinite(value) or 2.0 < value < 0.0:
+                if not np.isfinite(value) or not 0.0 <= value <= 2.0:
                     return SetParametersResult(
                         successful=False,
                         reason=f"{param.name} must be finite and between 0-2",

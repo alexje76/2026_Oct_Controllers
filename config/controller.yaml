@@ -1,6 +1,16 @@
 /oct_controllers:
   ros__parameters:
+    use_sim_time: true
+
     active_policy: linear_damper
+
+    piston_soft_stop_enabled: false
+
+    stepwise_integrated_u_range: 35.0
+
     linear_damper_scale_factor: 1.0
     linear_damper_retract_factor: 0.6
+
+    nextwave_log_interval_sec: 60.0
+    nextwave_stale_sec: 20.0
 
