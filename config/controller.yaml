@@ -1,4 +1,6 @@
 /oct_controllers:
   ros__parameters:
-    foo: 1.0
+    active_policy: linear_damper
+    linear_damper_scale_factor: 1.0
+    linear_damper_retract_factor: 0.6
 
