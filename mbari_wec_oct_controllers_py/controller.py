@@ -732,7 +732,7 @@ class Controller(Interface):
 
     def set_params(self):
         #Policy logging Params
-        self.declare_parameter("active_policy", "free_response")
+        self.declare_parameter("active_policy", "linear_damper")
 
         requested_policy = self.get_parameter("active_policy").value
 
