@@ -238,24 +238,15 @@ class NextWavePredictionStore:
 class ControlPolicy(object):
     """Common for all control policies"""
     def __init__(self, logger):
-        self.state = {
-            "range": 0.0,
-        }
         self.lock = threading.Lock()
         self._logger = logger
-
-    ## Updates for Spring Callback ##
-    def update_range(self, value):
-        with self.lock:
-            self.state["range"] = float(value) * 39.3701 #Converts from m to in
-
 
     def update_params(self, now):
         """Placeholder update_params"""
         pass
 
     def reset(self):
-        """Reset state when entering/leaving control mode"""
+        """Placeholder reset state when entering/leaving control mode"""
         pass
 
 ################## Control Policies ###################################
@@ -319,6 +310,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
        Control that provides stepwise random control inputs 
         on an integrated interval
        Is bounded by piston stroke 
+       Has the max current as a parameter
     """
     def __init__(self, logger):
         super().__init__(logger)
@@ -365,6 +357,10 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
                     self._swap_time = now
                 else:
                     pass
+
+    def set_u_range(self, value):
+        with self.lock:
+            self._u_range = float(value)
 
     def target(self, state, now):
         self._target["Value"] = self.u
@@ -453,12 +449,17 @@ class NextWaveSpringPolicy(ControlPolicy):
         if predicted_elevation_m is None:
             return {"Control Knob": "Bias Current", "Value": 0.0}
 
+        # Convert the NextWave prediction from meters to inches.
         predicted_range_inches = predicted_elevation_m * self._METERS_TO_INCHES
-        with self.lock:
-            measured_range_inches = self.state["range"]
 
-        # Note elevation and spring range have different physical zero points
-        error_inches = predicted_range_inches - measured_range_inches
+        measured_range_inches = state.get("range") #Stored in inches
+        #Check range, fallback if non or not finite
+        if measured_range_inches is None or not np.isfinite(measured_range_inches):
+            return {"Control Knob": "Bias Current", "Value": 0.0}
+
+        #Error between predicted range and piston position (intentionally ignores
+        # the discrepancy of heave cone)
+        error_inches = predicted_range_inches - float(measured_range_inches)
 
         self._bias_current = np.clip(
             self._GAIN_AMPS_PER_INCH * error_inches,
@@ -470,6 +471,55 @@ class NextWaveSpringPolicy(ControlPolicy):
 
     def reset(self):
         self._bias_current = 0.0
+        pass
+
+class LinearDamperPolicy(ControlPolicy):
+    """MBARI WEC cloned linear damper based on motor RPM."""
+
+    def __init__(self, logger):
+        super().__init__(logger)
+
+        self._torque_constant = 0.438  # N-m/A
+        self._n_spec = np.array(
+            [0.0, 300.0, 600.0, 1000.0, 1700.0, 4400.0, 6790.0],
+            dtype=float,
+        )
+        self._torque_spec = np.array(
+            [0.0, 0.0, 0.8, 2.9, 5.6, 9.8, 16.6],
+            dtype=float,
+        )
+        self._current_spec = np.zeros_like(self._torque_spec)
+        self.scale_factor = 1.0
+        self.retract_factor = 0.6
+        self.update_params(None)
+
+    def update_params(self, now=None):
+        """Update RPM-to-winding-current lookup values."""
+        with self.lock:
+            self._current_spec = self._torque_spec / self._torque_constant
+
+    def set_gains(self, scale_factor, retract_factor):
+        with self.lock:
+            self.scale_factor = float(scale_factor)
+            self.retract_factor = float(retract_factor)
+
+    def target(self, state, now):
+        """Calculate the damping winding-current target."""
+        rpm = float(state.get("rpm", 0.0))
+        if not np.isfinite(rpm):
+            return {"Control Knob": "Winding Current", "Value": 0.0}
+
+        with self.lock:
+            current = float(
+                np.interp(abs(rpm), self._n_spec, self._current_spec)
+            )
+            current *= self.scale_factor
+            if rpm > 0.0:
+                current *= -self.retract_factor
+
+        return {"Control Knob": "Winding Current", "Value": current}
+
+    def reset(self):
         pass
 
 class Controller(Interface):
@@ -488,9 +538,11 @@ class Controller(Interface):
 
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
-        self.state = {}
-        self._piston_range_inches = None
-        self._piston_soft_stop_enabled = True
+        self.state = {
+            "rpm": 0.0,
+            "range": None, #Stored in inches
+        }
+        self._piston_soft_stop_enabled = False
         self._csv_logger = DailyCsvLogger()
 
         self._nextwave_logger = DailyCsvLogger(prefix="nextwave", header=NEXTWAVE_HEADER)
@@ -512,8 +564,9 @@ class Controller(Interface):
                 self.get_logger(),
                 self.nextwave_predictions,
             ),
+            "linear_damper": LinearDamperPolicy(self.get_logger()),
         }
-        self.active_policy_name = "free_response"
+        self.active_policy_name = "linear_damper"
 
         self.set_params()
 
@@ -680,17 +733,36 @@ class Controller(Interface):
     def set_params(self):
         #Policy logging Params
         self.declare_parameter("active_policy", "free_response")
-        self.declare_parameter("piston_soft_stop_enabled", True)
 
-        self._piston_soft_stop_enabled = (
-            self.get_parameter("piston_soft_stop_enabled").value
-        )
         requested_policy = self.get_parameter("active_policy").value
 
         if requested_policy not in self.policies:
             raise ValueError(f"Unknown policy: {requested_policy}")
 
         self.active_policy_name = requested_policy
+
+        #Bounding Params
+        self.declare_parameter("piston_soft_stop_enabled", False)
+
+        self._piston_soft_stop_enabled = (
+            self.get_parameter("piston_soft_stop_enabled").value
+        )
+
+        #Policy Limits Params
+        self.declare_parameter("stepwise_integrated_u_range", 35.0)
+
+        self.policies["stepwise_integrated_bounded"].set_u_range(
+            self.get_parameter("stepwise_integrated_u_range").value
+        )
+
+        #Linear Damper Params
+        self.declare_parameter("linear_damper_scale_factor", 1.0)
+        self.declare_parameter("linear_damper_retract_factor", 0.6)
+
+        self.policies["linear_damper"].set_gains(
+            self.get_parameter("linear_damper_scale_factor").value,
+            self.get_parameter("linear_damper_retract_factor").value,
+        )
 
         #NextWave logging Params
         self.declare_parameter("nextwave_log_interval_sec", 60.0)
@@ -703,7 +775,8 @@ class Controller(Interface):
         )
 
     def parameter_callback(self, params):
-        for param in params:
+        for param in params: #Check inputs for viability
+            #Policy Logging
             if (
                 param.name == "active_policy"
                 and param.value not in self.policies
@@ -713,6 +786,7 @@ class Controller(Interface):
                     reason=f"Unknown policy: {param.value}",
                 )
 
+            #Bounding
             if (
                 param.name == "piston_soft_stop_enabled"
                 and not isinstance(param.value, bool)
@@ -722,12 +796,78 @@ class Controller(Interface):
                     reason="piston_soft_stop_enabled must be a boolean",
                 )
 
-        for param in params:
+            #Policy Limits
+            if param.name == "stepwise_integrated_u_range":
+                try:
+                    u_range = float(param.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False,
+                        reason="stepwise_integrated_u_range must be a number",
+                    )
+
+                if not np.isfinite(u_range) or u_range < 0.0 or u_range > 35.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="stepwise_integrated_u_range must be between 0 and 35",
+                    )
+
+            if param.name in {
+                "linear_damper_scale_factor",
+                "linear_damper_retract_factor",
+            }:
+                try:
+                    value = float(param.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"{param.name} must be a number",
+                    )
+
+                if not np.isfinite(value) or not 0.0 <= value <= 2.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"{param.name} must be finite and between 0-2",
+                    )
+
+        for param in params: #Change
+            #Bounding
             if param.name == "piston_soft_stop_enabled":
                 with self._state_lock:
                     self._piston_soft_stop_enabled = param.value
                 continue
 
+            #Policy limits/changes
+            if param.name == "stepwise_integrated_u_range":
+                self.policies["stepwise_integrated_bounded"].set_u_range(
+                    param.value
+                )
+                continue
+
+            linear_damper_gain_names = {
+                "linear_damper_scale_factor",
+                "linear_damper_retract_factor",
+            }
+            if any(param.name in linear_damper_gain_names for param in params):
+                scale_factor = float(
+                    self.get_parameter("linear_damper_scale_factor").value
+                )
+                retract_factor = float(
+                    self.get_parameter("linear_damper_retract_factor").value
+                )
+
+                for param in params:
+                    if param.name == "linear_damper_scale_factor":
+                        scale_factor = float(param.value)
+                    elif param.name == "linear_damper_retract_factor":
+                        retract_factor = float(param.value)
+
+                self.policies["linear_damper"].set_gains(
+                    scale_factor,
+                    retract_factor,
+                )
+
+            #Changing Policy
             if param.name != "active_policy":
                 continue
 
@@ -758,7 +898,8 @@ class Controller(Interface):
     def piston_bounding(self, target):
         """Override any policy target with winding current near stroke limits."""
         with self._state_lock:
-            piston_range = self._piston_range_inches
+            # Controller.state["range"] is stored in inches.
+            piston_range = self.state.get("range")
             enabled = self._piston_soft_stop_enabled
 
         if not enabled or piston_range is None:
@@ -853,9 +994,15 @@ class Controller(Interface):
         pass
 
     def power_callback(self, data):
-        """Provide feedback of '/power_data' topic from Power Controller."""
-        # Update class variables, get control policy target, send commands, etc.
-        pass
+        """Provide feedback of '/power_data' from the Power Controller."""
+        with self._state_lock:
+            self.state["rpm"] = float(data.rpm)
+
+        with self._policy_lock:
+            linear_damper_active = self.active_policy_name == "linear_damper"
+
+        if linear_damper_active:
+            self.send_command()
 
     def powerbuoy_callback(self, data):
         """Provide feedback of '/powerbuoy_data' topic -- Aggregated data from all topics."""
@@ -881,17 +1028,20 @@ class Controller(Interface):
 
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
+        # Store spring message range in inches.
         piston_range_inches = float(data.range_finder) * 39.3701
 
         with self._state_lock:
-            self._piston_range_inches = piston_range_inches
+            self.state["range"] = piston_range_inches
 
-        ## Update
-        self.active_policy.update_range(data.range_finder)
         self.active_policy.update_params(self.get_clock().now())
 
-        ## Send out command
-        self.send_command()
+        # Send out command if not in linear damping mode.
+        with self._policy_lock:
+            linear_damper_active = self.active_policy_name == "linear_damper"
+
+        if not linear_damper_active:
+            self.send_command()
 
     def trefoil_callback(self, data):
         """Provide feedback of '/trefoil_data' topic from Trefoil Controller."""
