@@ -314,6 +314,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
     """
     def __init__(self, logger):
         super().__init__(logger)
+        #Use self._logger.info( f"text{}")
 
         self._u_on = False # Control State
         self._u_range = 35
@@ -331,13 +332,7 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
 
     def update_params(self, now):
         #Setup Call
-        self.get_logger().info(
-            f"Send Command function called without matching control"
-        )
         if now is None:
-            self.get_logger().info(
-                f"Returned in none "
-                )
             return
 
         with self.lock:
@@ -387,7 +382,7 @@ class FreeResponsePolicy(ControlPolicy):
         super().__init__(logger)
 
         self._target = {
-            "Control Knob": 'None',
+            "Control Knob": 'Winding Current',
             "Value": 0.0,
         }
         self.update_params(None)
@@ -751,9 +746,13 @@ class Controller(Interface):
 
         self.active_policy_name = requested_policy
 
-        #Bounding Params
+        #Bounding and safeguard Params
+        self.declare_parameter("send_commands", True)        
         self.declare_parameter("piston_soft_stop_enabled", False)
 
+        self._send_commands = (
+            self.get_parameter("send_commands").value
+        )
         self._piston_soft_stop_enabled = (
             self.get_parameter("piston_soft_stop_enabled").value
         )
@@ -796,7 +795,16 @@ class Controller(Interface):
                     reason=f"Unknown policy: {param.value}",
                 )
 
-            #Bounding
+            #Bounding and safeguards
+            if (
+                param.name == "send_commands"
+                and not isinstance(param.value, bool)
+            ):
+                return SetParametersResult(
+                    successful=False,
+                    reason="send_commands must be a boolean",
+                )
+            
             if (
                 param.name == "piston_soft_stop_enabled"
                 and not isinstance(param.value, bool)
@@ -841,7 +849,11 @@ class Controller(Interface):
                     )
 
         for param in params: #Change
-            #Bounding
+            #Bounding and safeguards
+            if param.name == "send_commands":
+                self._send_commands = param.value
+                continue
+
             if param.name == "piston_soft_stop_enabled":
                 with self._state_lock:
                     self._piston_soft_stop_enabled = param.value
@@ -1070,37 +1082,39 @@ class Controller(Interface):
         target  = policy.target(state, now) #Get target with screenshot
         target, clear_bias_current = self.piston_bounding(target)
 
-        if clear_bias_current:
-            self.send_pc_bias_curr_command(0.0, blocking=False)
-
         self.get_logger().info(
             f"{self.active_policy_name} sending {target['Control Knob']} value {target['Value']}"
         )
-        match target["Control Knob"]:
-            case 'Pump':
-                self.send_pump_command(target["Value"], blocking=False)
-            case 'Valve':
-                self.send_valve_command(target["Value"], blocking=False)
-            case 'Winding Current':
-                self.send_pc_wind_curr_command(target["Value"], blocking=False)
-            case 'Bias Current':
-                self.send_pc_bias_curr_command(target["Value"], blocking=False)
-            case 'Scale':
-                self.send_pc_scale_command(target["Value"], blocking=False)
-            case 'Retract':
-                self.send_pc_retract_command(target["Value"], blocking=False)
-            case 'No Command Pause': #Doesn't cancel previous commands 
-                pass
-            case 'None':
-                    self.send_pump_command(0.0, blocking=False)
-                    self.send_valve_command(0.0, blocking=False)
-                    self.send_pc_wind_curr_command(0.0, blocking=False)
-                    self.send_pc_bias_curr_command(0.0, blocking=False)
-            case _:
-                self.get_logger().info(
-                    f"Send Command function called without matching control"
-                    )
-                pass
+   
+        if self._send_commands:
+            if clear_bias_current:
+                self.send_pc_bias_curr_command(0.0, blocking=False)
+
+            match target["Control Knob"]:
+                case 'Pump':
+                    self.send_pump_command(target["Value"], blocking=False)
+                case 'Valve':
+                    self.send_valve_command(target["Value"], blocking=False)
+                case 'Winding Current':
+                    self.send_pc_wind_curr_command(target["Value"], blocking=False)
+                case 'Bias Current':
+                    self.send_pc_bias_curr_command(target["Value"], blocking=False)
+                case 'Scale':
+                    self.send_pc_scale_command(target["Value"], blocking=False)
+                case 'Retract':
+                    self.send_pc_retract_command(target["Value"], blocking=False)
+                case 'No Command Pause': #Doesn't cancel previous commands 
+                    pass
+                case 'None': #Generally do not use as it causes issues with physical hardware
+                        self.send_pump_command(0.0, blocking=False)
+                        self.send_valve_command(0.0, blocking=False)
+                        self.send_pc_wind_curr_command(0.0, blocking=False)
+                        self.send_pc_bias_curr_command(0.0, blocking=False)
+                case _:
+                    self.get_logger().info(
+                        f"Send Command function called without matching control"
+                        )
+                    pass
 
 def main():
     rclpy.init()

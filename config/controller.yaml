@@ -1,6 +1,7 @@
 /oct_controllers:
   ros__parameters:
     use_sim_time: true
+    send_commands: true
 
     active_policy: linear_damper
 

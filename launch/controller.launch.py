@@ -25,6 +25,7 @@ package_name = 'mbari_wec_oct_controllers_py'
 # Convert launch argument strings to the ROS parameter types expected by the controller.
 PARAM_TYPES = {
     'use_sim_time': bool,
+    'send_commands': bool,
     'active_policy': str,
     'piston_soft_stop_enabled': bool,
     'stepwise_integrated_u_range': float,
