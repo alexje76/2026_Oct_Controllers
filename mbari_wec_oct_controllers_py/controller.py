@@ -331,7 +331,13 @@ class StepwiseIntegratedBoundedPolicy(ControlPolicy):
 
     def update_params(self, now):
         #Setup Call
+        self.get_logger().info(
+            f"Send Command function called without matching control"
+        )
         if now is None:
+            self.get_logger().info(
+                f"Returned in none "
+                )
             return
 
         with self.lock:
@@ -427,6 +433,7 @@ class NextWaveSpringPolicy(ControlPolicy):
     def target(self, state, now):
         prediction = self.nextwave_predictions.snapshot()
         now_seconds = now.nanoseconds / 1e9
+
         prediction_age = now_seconds - prediction["arrival_time_seconds"]
 
         if prediction_age < 0.0 or prediction_age > self._MAX_PREDICTION_AGE_SECONDS:
@@ -453,6 +460,12 @@ class NextWaveSpringPolicy(ControlPolicy):
         predicted_range_inches = predicted_elevation_m * self._METERS_TO_INCHES
 
         measured_range_inches = state.get("range") #Stored in inches
+
+        ###curr_pred_time = times[0]
+        ###predicted_now_elev_now_m = self._interpolate(times, elevations, curr_pred_time)
+        ###predicted_now_elev_now_in = predicted_now_elev_now_m
+
+
         #Check range, fallback if non or not finite
         if measured_range_inches is None or not np.isfinite(measured_range_inches):
             return {"Control Knob": "Bias Current", "Value": 0.0}
@@ -460,6 +473,8 @@ class NextWaveSpringPolicy(ControlPolicy):
         #Error between predicted range and piston position (intentionally ignores
         # the discrepancy of heave cone)
         error_inches = predicted_range_inches - float(measured_range_inches)
+        ###error_inches = predicted_range_inches - predicted_now_elev_now_in
+
 
         self._bias_current = np.clip(
             self._GAIN_AMPS_PER_INCH * error_inches,
@@ -528,13 +543,8 @@ class Controller(Interface):
     def __init__(self):
         super().__init__('controller')
 
-        self.set_parameters([
-            Parameter(
-                'use_sim_time',
-                Parameter.Type.BOOL,
-                True,
-            ),
-        ])
+        if self.get_parameter("use_sim_time").value:
+            self.use_sim_time()
 
         self._policy_lock = threading.Lock()
         self._state_lock = threading.Lock()
