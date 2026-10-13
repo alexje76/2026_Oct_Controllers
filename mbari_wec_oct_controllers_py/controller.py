@@ -1055,7 +1055,7 @@ class Controller(Interface):
     def spring_callback(self, data):
         """Provide feedback of '/spring_data' topic from Spring Controller."""
         # Store spring message range in inches.
-        piston_range_inches = float(data.range_finder) #* 39.3701 #In real this seems 
+        piston_range_inches = float(data.range_finder) * 39.3701 
 
         with self._state_lock:
             self.state["range"] = piston_range_inches
