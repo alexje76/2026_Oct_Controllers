@@ -1115,6 +1115,11 @@ class Controller(Interface):
                         f"Send Command function called without matching control"
                         )
                     pass
+        else:
+            self.get_logger().info(
+                f"Not in send_command mode"
+                )
+
 
 def main():
     rclpy.init()
