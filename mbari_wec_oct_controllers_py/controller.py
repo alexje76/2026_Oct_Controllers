@@ -467,7 +467,11 @@ class NextWaveSpringPolicy(ControlPolicy):
 
         #Error between predicted range and piston position (intentionally ignores
         # the discrepancy of heave cone)
+
         error_inches = predicted_range_inches - float(measured_range_inches)
+        self._logger.info(
+            f"Error in = {error_inches}, Pred_range_in = {predicted_range_inches}, measured_range_in = {measured_range_inches}"
+        )
         ###error_inches = predicted_range_inches - predicted_now_elev_now_in
 
 
