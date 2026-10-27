@@ -22,6 +22,15 @@ from launch_ros.actions import Node
 
 package_name = 'mbari_wec_oct_controllers_py'
 
+DEFAULT_NODE_NAME = 'oct_controller_active'
+
+ALLOWED_NODE_NAMES = [
+    'oct_controller_active',
+    'oct_controller_sim_active',
+    'oct_controller_logging_nw',
+    'oct_controller_logging_ld'
+]
+
 # Convert launch argument strings to the ROS parameter types expected by the controller.
 PARAM_TYPES = {
     'use_sim_time': bool,
@@ -46,6 +55,10 @@ def _as_bool(value):
 
 
 def _launch_node(context, config):
+    node_name = LaunchConfiguration('node_name').perform(context).strip()
+    if node_name not in ALLOWED_NODE_NAMES:
+        raise RuntimeError('The node_name launch argument appears to be' \
+        ' either misspelled or was not added to allowed name list')
     overrides = {}
     for name, value_type in PARAM_TYPES.items():
         value = LaunchConfiguration(name).perform(context)
@@ -54,13 +67,15 @@ def _launch_node(context, config):
             continue
         overrides[name] = _as_bool(value) if value_type is bool else value_type(value)
 
-    return [Node(
-        package=package_name,
-        name='oct_controllers',
-        executable='oct_controllers',
-        parameters=[config, overrides],  # YAML first; supplied launch args override it.
-        output='screen',
-    )]
+    return [
+        Node(
+            package=package_name,
+            name=node_name,
+            executable='oct_controllers',
+            parameters=[config, overrides],  # YAML first; supplied launch args override it.
+            output='screen',
+        )
+    ]
 
 
 def generate_launch_description():
@@ -71,8 +86,18 @@ def generate_launch_description():
     )
 
     args = [
-        DeclareLaunchArgument(name, default_value='', description=f'Override {name} from YAML')
-        for name in PARAM_TYPES
+        DeclareLaunchArgument(
+            'node_name',
+            default_value=DEFAULT_NODE_NAME,
+            description=f'Name of controller node to launch'
+        ),
+        *[
+            DeclareLaunchArgument(
+                name, 
+                default_value='', 
+                description=f'Override {name} from YAML')
+            for name in PARAM_TYPES
+        ]
     ]
 
     return LaunchDescription(args + [OpaqueFunction(function=lambda context: _launch_node(context, config))])

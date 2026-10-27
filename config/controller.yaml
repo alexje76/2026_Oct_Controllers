@@ -1,6 +1,8 @@
-/oct_controllers:
+#In order to add a node you must add the node config here as well as
+#In the launch file node names list. 
+/oct_controller_active:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
     send_commands: true
 
     active_policy: linear_damper
@@ -15,3 +17,53 @@
     nextwave_log_interval_sec: 60.0
     nextwave_stale_sec: 20.0
 
+/oct_controller_sim_active:
+  ros__parameters:
+    use_sim_time: false
+    send_commands: true
+
+    active_policy: linear_damper
+
+    piston_soft_stop_enabled: false
+
+    stepwise_integrated_u_range: 35.0
+
+    linear_damper_scale_factor: 1.0
+    linear_damper_retract_factor: 0.6
+
+    nextwave_log_interval_sec: 60.0
+    nextwave_stale_sec: 20.0
+
+/oct_controller_logging_nw:
+  ros__parameters:
+    use_sim_time: false
+    send_commands: false
+
+    active_policy: nextwave_spring
+
+    piston_soft_stop_enabled: false
+
+    stepwise_integrated_u_range: 35.0
+
+    linear_damper_scale_factor: 1.0
+    linear_damper_retract_factor: 0.6
+
+    nextwave_log_interval_sec: 60.0
+    nextwave_stale_sec: 20.0
+
+/oct_controller_logging_ld:
+  ros__parameters:
+    use_sim_time: false
+    send_commands: false
+
+    active_policy: linear_damper
+
+    piston_soft_stop_enabled: false
+
+    stepwise_integrated_u_range: 35.0
+
+    linear_damper_scale_factor: 1.0
+    linear_damper_retract_factor: 0.6
+
+    nextwave_log_interval_sec: 60.0
+    nextwave_stale_sec: 20.0
