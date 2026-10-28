@@ -91,11 +91,14 @@ class DailyCsvLogger:
         "event",
         "controller",
         "previous_controller",
+        'parameter',
+        'old_value',
+        'new_value',
     )
 
-    def __init__(self, prefix="controller", header=None):
+    def __init__(self, prefix="controller", header=None, directory=OUTPUT_DIR):
         self._lock = threading.Lock()
-        self._directory = Path(OUTPUT_DIR)
+        self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
 
         self._prefix = prefix #Assumses controller log^
@@ -162,6 +165,9 @@ class DailyCsvLogger:
         event,
         controller,
         previous_controller="",
+        parameter="",
+        old_value="",
+        new_value="",
         ros_time_ns=None,
         flush=False,
     ):
@@ -552,9 +558,14 @@ class Controller(Interface):
             "range": None, #Stored in inches
         }
         self._piston_soft_stop_enabled = False
-        self._csv_logger = DailyCsvLogger()
 
-        self._nextwave_logger = DailyCsvLogger(prefix="nextwave", header=NEXTWAVE_HEADER)
+        node_log_dir = Path(OUTPUT_DIR) / self.get_name()#Loggers
+        self._csv_logger = DailyCsvLogger(directory=node_log_dir)
+        self._nextwave_logger = DailyCsvLogger(
+                                        prefix="nextwave",
+                                        header=NEXTWAVE_HEADER,
+                                        directory=node_log_dir,
+                                        )
         self._nextwave_lock = threading.Lock()
         self._nextwave_last = {}          # latest-window scalars (msg fields)
         self._nextwave_solve_times = []   # buffered data.solve_time per window
@@ -600,6 +611,9 @@ class Controller(Interface):
         event,
         controller,
         previous_controller="",
+        paramter="",
+        old_value="",
+        new_value="",
         flush=False,
     ):
         # Node.get_clock() is ROS_TIME. It follows /clock when
@@ -610,6 +624,9 @@ class Controller(Interface):
             event=event,
             controller=controller,
             previous_controller=previous_controller,
+            parameter=parameter,
+            old_value=old_value,
+            new_value=new_value,
             ros_time_ns=ros_time_ns,
             flush=flush,
         )
@@ -852,6 +869,11 @@ class Controller(Interface):
                         reason=f"{param.name} must be finite and between 0-2",
                     )
 
+        changes = [] #Record changed values in parameters
+        for param in params:
+            old_value = self.get_parameter(param.name).value
+            if old_value != param.value:
+                changes.append((param.name, old_value, param.value))
         for param in params: #Change
             #Bounding and safeguards
             if param.name == "send_commands":
@@ -919,6 +941,15 @@ class Controller(Interface):
                     flush=True,
                 )
 
+        for name, old_value, new_value in changes:
+            self._log_csv(
+                event="parameter_changed",
+                controller=self.active_policy_name,
+                parameter=name,
+                old_value=old_value,
+                new_value=new_value,
+                flush=True
+            )
         return SetParametersResult(successful=True)
 
     def piston_bounding(self, target):
