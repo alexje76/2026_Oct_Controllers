@@ -559,7 +559,8 @@ class Controller(Interface):
         }
         self._piston_soft_stop_enabled = False
 
-        node_log_dir = Path(OUTPUT_DIR) / self.get_name()#Loggers
+        #Loggers 
+        node_log_dir = Path(OUTPUT_DIR) / self.get_name() / datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%SZ")
         self._csv_logger = DailyCsvLogger(directory=node_log_dir)
         self._nextwave_logger = DailyCsvLogger(
                                         prefix="nextwave",
