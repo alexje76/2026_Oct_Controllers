@@ -611,7 +611,7 @@ class Controller(Interface):
         event,
         controller,
         previous_controller="",
-        paramter="",
+        parameter="",
         old_value="",
         new_value="",
         flush=False,
